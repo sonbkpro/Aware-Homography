@@ -6,7 +6,7 @@ Main training script for MultiPlaneHomographyNet.
 Usage:
     python train.py --config configs/default.yaml
     python train.py --config configs/default.yaml --resume checkpoints/epoch_010.pth
-    python train.py --config configs/my_config.yaml --gpu 1
+    python train.py --config configs/my_config.yaml --gpus 0 1 2
 
 After `pip install -e .`:
     dh-train --config configs/default.yaml
@@ -48,7 +48,14 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Train MultiPlaneHomographyNet")
     p.add_argument("--config",  default="configs/default.yaml", help="YAML config path")
     p.add_argument("--resume",  default=None, help="Checkpoint path to resume from")
-    p.add_argument("--gpu",     type=int, default=0, help="GPU index (-1 = CPU)")
+    p.add_argument(
+        "--gpus",
+        type=int,
+        nargs="+",
+        default=[0],
+        metavar="ID",
+        help="GPU IDs to use for training (e.g. --gpus 0 1 2). Pass -1 to force CPU.",
+    )
     p.add_argument("--workers", type=int, default=None, help="Override num_workers")
     return p.parse_args(argv)
 
@@ -132,10 +139,16 @@ def validate(model, val_loader, criterion, device, cfg, step, writer):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(cfg, args):
-    device = torch.device(
-        f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available() else "cpu"
-    )
-    log.info(f"Device: {device}")
+    # ── GPU selection via CUDA_VISIBLE_DEVICES ─────────────────────────────────
+    gpus = args.gpus
+    use_cuda = torch.cuda.is_available() and not (len(gpus) == 1 and gpus[0] < 0)
+    if use_cuda:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
+        device = torch.device("cuda:0")
+        log.info(f"Using GPU(s) {gpus}  →  CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}")
+    else:
+        device = torch.device("cpu")
+        log.info("Using CPU")
 
     if args.workers is not None:
         cfg["data"]["num_workers"] = args.workers
@@ -145,14 +158,19 @@ def train(cfg, args):
     log.info(f"Train: {len(train_loader.dataset):,} triplets | Val: {len(val_loader.dataset):,}")
 
     model = build_model(cfg).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if use_cuda and len(gpus) > 1:
+        model = nn.DataParallel(model, device_ids=list(range(len(gpus))))
+        log.info(f"DataParallel: {len(gpus)} GPU(s) (device_ids={list(range(len(gpus)))})")
+    # raw_model: unwrapped module — used for custom methods, optimizer params, and I/O
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    n_params = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     log.info(f"Trainable parameters: {n_params:,}")
 
     criterion = TotalLoss(cfg)
     stn       = HomographySTN().to(device)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        raw_model.parameters(),
         lr=cfg["train"]["lr"],
         betas=(cfg["train"]["beta1"], cfg["train"]["beta2"]),
         eps=cfg["train"]["eps"],
@@ -166,7 +184,7 @@ def train(cfg, args):
 
     start_epoch, global_step, best_error = 0, 0, float("inf")
     if args.resume:
-        ckpt = load_checkpoint(args.resume, model, optimizer, scheduler)
+        ckpt = load_checkpoint(args.resume, raw_model, optimizer, scheduler)
         start_epoch  = ckpt["epoch"] + 1
         global_step  = ckpt["global_step"]
         best_error   = ckpt["best_error"]
@@ -185,7 +203,7 @@ def train(cfg, args):
     log.info(f"Training for {max_epochs} epochs (warmup={warmup_epochs})...")
 
     for epoch in range(start_epoch, max_epochs):
-        model.set_warmup_mode(epoch < warmup_epochs)
+        raw_model.set_warmup_mode(epoch < warmup_epochs)
         if epoch < warmup_epochs:
             log.info(f"Epoch {epoch}: WARMUP stage (mask attention disabled)")
 
@@ -200,10 +218,10 @@ def train(cfg, args):
             img_c = batch["img_c"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            out    = model.forward_triplet(img_a, img_b, img_c, num_iters)
-            losses = criterion(out, img_a, img_b, img_c, model.feature_extractor, stn)
+            out    = raw_model.forward_triplet(img_a, img_b, img_c, num_iters)
+            losses = criterion(out, img_a, img_b, img_c, raw_model.feature_extractor, stn)
             losses["total"].backward()
-            nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+            nn.utils.clip_grad_norm_(raw_model.parameters(), clip_norm)
             optimizer.step()
 
             for k in running:
@@ -237,18 +255,18 @@ def train(cfg, args):
         writer.add_scalar("train/lr", lr_now, global_step)
         scheduler.step()
 
-        val_error = validate(model, val_loader, criterion, device, cfg, global_step, writer)
+        val_error = validate(raw_model, val_loader, criterion, device, cfg, global_step, writer)
 
         if (epoch + 1) % save_interval == 0:
             save_checkpoint(
                 str(ckpt_dir / f"epoch_{epoch:03d}.pth"),
-                model, optimizer, scheduler, epoch, global_step, best_error,
+                raw_model, optimizer, scheduler, epoch, global_step, best_error,
             )
         if val_error < best_error:
             best_error = val_error
             save_checkpoint(
                 str(ckpt_dir / "best_model.pth"),
-                model, optimizer, scheduler, epoch, global_step, best_error,
+                raw_model, optimizer, scheduler, epoch, global_step, best_error,
             )
             log.info(f"  ↳ New best model (error={best_error:.4f})")
 
