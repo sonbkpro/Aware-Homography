@@ -253,9 +253,12 @@ def build_train_loader(cfg: dict) -> DataLoader:
         video_root=d["video_path"], transform=transform,
         frame_gap=d["triplet_gap"], split="train", train_ratio=d["train_split"],
     )
+    nw = d["num_workers"]
     return DataLoader(
         dataset, batch_size=t["batch_size"], shuffle=True,
-        num_workers=d["num_workers"], pin_memory=d["pin_memory"], drop_last=True,
+        num_workers=nw, pin_memory=d["pin_memory"], drop_last=True,
+        multiprocessing_context="spawn" if nw > 0 else None,
+        persistent_workers=nw > 0,
     )
 
 
@@ -270,9 +273,12 @@ def build_val_loader(cfg: dict) -> DataLoader:
         video_root=d["video_path"], transform=transform,
         frame_gap=d["triplet_gap"], split="val", train_ratio=d["train_split"],
     )
+    nw = d["num_workers"]
     return DataLoader(
         dataset, batch_size=e["batch_size"], shuffle=False,
-        num_workers=d["num_workers"], pin_memory=d["pin_memory"],
+        num_workers=nw, pin_memory=d["pin_memory"],
+        multiprocessing_context="spawn" if nw > 0 else None,
+        persistent_workers=nw > 0,
     )
 
 

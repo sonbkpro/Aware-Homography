@@ -51,7 +51,7 @@ class _TripletWrapper(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, img_a, img_b, img_c, num_iters):
+    def forward(self, img_a, img_b, img_c, *, num_iters):
         return self.model.forward_triplet(img_a, img_b, img_c, num_iters)
 
 
@@ -233,7 +233,7 @@ def train(cfg, args):
             optimizer.zero_grad(set_to_none=True)
 
             if dp_model is not None:
-                out = dp_model(img_a, img_b, img_c, num_iters)
+                out = dp_model(img_a, img_b, img_c, num_iters=num_iters)
             else:
                 out = raw_model.forward_triplet(img_a, img_b, img_c, num_iters)
 
