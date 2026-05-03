@@ -1,0 +1,80 @@
+# ============================================================
+# Default configuration — Multi-Plane Unsupervised Homography
+# ============================================================
+
+# ── Data ─────────────────────────────────────────────────────
+data:
+  video_path:      "data/videos"     # Root dir with video files (recursive)
+  patch_height:    315               # Crop height (matches original paper)
+  patch_width:     560               # Crop width
+  frame_gap:       1                 # Temporal gap between pairs
+  triplet_gap:     1                 # Gap for triplets (t, t+g, t+2g)
+  grayscale:       true              # Convert to grayscale (matches paper)
+  normalize_mean:  0.485
+  normalize_std:   0.229
+  train_split:     0.9               # Fraction of videos used for training
+  num_workers:     4
+  pin_memory:      true
+
+# ── Model ─────────────────────────────────────────────────────
+model:
+  backbone:         "resnet34"       # resnet18 | resnet34 | resnet50
+  use_dino:         false            # Frozen DINOv2 side branch
+  feature_dim:      128              # FPN output channels
+  fpn_levels:       [2, 3, 4]        # stride 4 / 8 / 16
+
+  num_planes:       2                # K=1 → reduces to original paper baseline
+  mask_hidden_dim:  128
+  mask_num_heads:   4
+  mask_num_layers:  2
+
+  corr_levels:      4
+  corr_radius:      4
+
+  hidden_dim:       128              # GRU hidden state
+  context_dim:      128
+
+  num_iters_train:  12               # GRU iterations during training
+  num_iters_eval:   24               # More iterations at test time
+
+  num_corr_points:  512              # Correspondences sampled for DLT
+  dlt_eps:          1.0e-6
+
+# ── Loss weights ───────────────────────────────────────────────
+loss:
+  lambda_recon:        1.0           # Per-plane feature reconstruction
+  lambda_triplet:      2.0           # Contrastive (matches paper λ=2)
+  lambda_geo:          0.1           # Geodesic inverse consistency
+  lambda_triangle:     0.1           # Triangle consistency (NEW)
+  lambda_mask_smooth:  0.01          # TV smoothness on masks
+  lambda_mask_entropy: 0.01          # Entropy → hard plane assignments
+  mu:                  0.01          # Inverse consistency weight (paper μ)
+  gamma:               0.85          # RAFT sequence loss decay
+
+# ── Training ───────────────────────────────────────────────────
+train:
+  batch_size:         8
+  epochs:             100
+  lr:                 1.0e-4
+  beta1:              0.9
+  beta2:              0.999
+  eps:                1.0e-8
+  weight_decay:       1.0e-5
+  lr_step_epochs:     [30, 60, 90]
+  lr_decay:           0.5
+  clip_grad_norm:     1.0
+  log_interval:       50             # Steps between TensorBoard logs
+  save_interval:      5              # Epochs between checkpoints
+  checkpoint_dir:     "checkpoints"
+  resume:             null
+
+  # Two-stage protocol (matches original paper strategy)
+  warmup_epochs:      10             # Stage 1: train without mask attention role
+
+# ── Evaluation ─────────────────────────────────────────────────
+eval:
+  batch_size:         4
+  num_iters:          24
+  visualize:          true
+  vis_dir:            "vis_results"
+  error_threshold:    3.0            # Pixel threshold for inlier counting

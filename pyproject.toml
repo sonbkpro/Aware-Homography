@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "deep-homography"
+version = "1.0.0"
+description = "Unsupervised Multi-Plane Deep Homography via Iterative Differentiable DLT and Plane-Aware Masks"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "numpy>=1.24.0",
+    "opencv-python>=4.7.0",
+    "Pillow>=9.5.0",
+    "PyYAML>=6.0",
+    "tensorboard>=2.13.0",
+    "tqdm>=4.65.0",
+    "einops>=0.6.1",
+    "kornia>=0.6.12",
+    "scipy>=1.10.0",
+    "matplotlib>=3.7.0",
+    "imageio>=2.28.0",
+]
+
+[project.scripts]
+dh-train    = "deep_homography.cli:train_entry"
+dh-evaluate = "deep_homography.cli:eval_entry"
+dh-demo     = "deep_homography.cli:demo_entry"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["deep_homography*"]
+
+[tool.setuptools.package-data]
+"deep_homography" = ["py.typed"]
