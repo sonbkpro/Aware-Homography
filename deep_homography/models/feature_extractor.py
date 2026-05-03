@@ -200,9 +200,9 @@ class MultiScaleFeatureExtractor(nn.Module):
     """
 
     _RESNET_CHANNELS = {
-        "resnet18":  [64,  128, 256],   # layer2, layer3, layer4 out-channels
-        "resnet34":  [128, 256, 512],
-        "resnet50":  [512, 1024, 2048],
+        "resnet18":  [64,  128, 256],   # layer1, layer2, layer3 out-channels
+        "resnet34":  [64,  128, 256],
+        "resnet50":  [256, 512, 1024],
     }
 
     def __init__(
