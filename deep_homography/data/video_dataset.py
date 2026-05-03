@@ -14,6 +14,7 @@ Extension for triangle consistency loss:
 Split is done at the VIDEO level, not frame level, to prevent leakage.
 """
 
+import math
 import os
 import glob
 import random
@@ -29,34 +30,79 @@ from deep_homography.data.augmentations import EvalTransform, TrainTransform
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 
+# Per-process VideoCapture cache. Each DataLoader worker is a separate process (spawn),
+# so this dict is not shared between workers — no locking needed.
+_VIDEO_CAP_CACHE: dict = {}
+
 
 def _is_video(path: str) -> bool:
     return Path(path).suffix.lower() in VIDEO_EXTENSIONS
 
 
-def _load_video_frames(video_path: str, stride: int = 1) -> List[np.ndarray]:
-    """
-    Reads all frames from a video file at a given stride.
-
-    Args:
-        video_path: Path to video file.
-        stride:     Read every `stride`-th frame.
-
-    Returns:
-        list of BGR np.ndarray (H, W, 3) uint8.
-    """
+def _count_video_frames(
+    video_path: str, stride: int = 1, max_frames: Optional[int] = None
+) -> int:
+    """Return the number of strided frames available (reads metadata only, no decode)."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video: {video_path}")
-    frames, idx = [], 0
-    while True:
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    if total <= 0:
+        # Fallback: count without decoding via grab()
+        cap = cv2.VideoCapture(video_path)
+        total = 0
+        while cap.grab():
+            total += 1
+        cap.release()
+    n = math.ceil(total / stride) if stride > 1 else total
+    return min(n, max_frames) if max_frames else n
+
+
+def _read_triplet(
+    video_path: str, strided_t: int, frame_gap: int, video_stride: int
+) -> List[np.ndarray]:
+    """Read 3 BGR frames at strided positions t, t+gap, t+2*gap using a per-process cache.
+
+    Uses cap.grab() (no decode) to skip intermediate frames efficiently, so
+    stride=1 / gap=1 (default) costs exactly 3 sequential cap.read() calls.
+    """
+    key = (os.getpid(), video_path)
+    cap = _VIDEO_CAP_CACHE.get(key)
+    if cap is None or not cap.isOpened():
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise IOError(f"Cannot open video: {video_path}")
+        _VIDEO_CAP_CACHE[key] = cap
+
+    phys = [
+        strided_t * video_stride,
+        (strided_t + frame_gap) * video_stride,
+        (strided_t + 2 * frame_gap) * video_stride,
+    ]
+
+    cur = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+    if cur != phys[0]:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, phys[0])
+        cur = phys[0]
+
+    frames: List[np.ndarray] = []
+    for target in phys:
+        while cur < target:
+            cap.grab()
+            cur += 1
         ret, frame = cap.read()
         if not ret:
-            break
-        if idx % stride == 0:
-            frames.append(frame)
-        idx += 1
-    cap.release()
+            # Re-open and retry once on read failure
+            cap = cv2.VideoCapture(video_path)
+            _VIDEO_CAP_CACHE[key] = cap
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+            ret, frame = cap.read()
+            if not ret:
+                raise IOError(f"Cannot read frame {target} from {video_path}")
+        frames.append(frame)
+        cur = target + 1
+
     return frames
 
 
@@ -114,24 +160,25 @@ class VideoHomographyDataset(Dataset):
             else all_videos
         )
 
-        self.frame_lists: List[List[np.ndarray]] = []
+        self.video_paths: List[str] = []
+        self.video_stride = video_stride
         self.index: List[Tuple[int, int]] = []
 
         print(f"[VideoHomographyDataset] Loading {len(selected)} videos (split={split})...")
         for vid_path in selected:
             try:
-                frames = _load_video_frames(vid_path, stride=video_stride)
+                n_frames = _count_video_frames(
+                    vid_path, stride=video_stride, max_frames=self.max_frames
+                )
             except IOError as e:
                 print(f"  WARNING: {e}")
                 continue
-            if self.max_frames:
-                frames = frames[: self.max_frames]
             min_len = 2 * frame_gap + 1
-            if len(frames) < min_len:
+            if n_frames < min_len:
                 continue
-            vid_idx = len(self.frame_lists)
-            self.frame_lists.append(frames)
-            for t in range(len(frames) - 2 * frame_gap):
+            vid_idx = len(self.video_paths)
+            self.video_paths.append(vid_path)
+            for t in range(n_frames - 2 * frame_gap):
                 self.index.append((vid_idx, t))
 
         print(f"[VideoHomographyDataset] {len(self.index):,} triplets ready.")
@@ -148,10 +195,10 @@ class VideoHomographyDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         vid_idx, t = self.index[idx]
-        frames = self.frame_lists[vid_idx]
-        g = self.frame_gap
 
-        triplet = [frames[t], frames[t + g], frames[t + 2 * g]]
+        triplet = _read_triplet(
+            self.video_paths[vid_idx], t, self.frame_gap, self.video_stride
+        )
 
         if self.transform is not None:
             img_a, img_b, img_c = self.transform(triplet)
@@ -290,7 +337,10 @@ def build_eval_loader(root: str, cfg: dict, gt_points_dir: str = None) -> DataLo
         grayscale=d["grayscale"], mean=d["normalize_mean"], std=d["normalize_std"],
     )
     dataset = ImagePairDataset(root=root, transform=transform, gt_points_dir=gt_points_dir)
+    nw = d["num_workers"]
     return DataLoader(
         dataset, batch_size=e["batch_size"], shuffle=False,
-        num_workers=d["num_workers"], pin_memory=d["pin_memory"],
+        num_workers=nw, pin_memory=d["pin_memory"],
+        multiprocessing_context="spawn" if nw > 0 else None,
+        persistent_workers=nw > 0,
     )
