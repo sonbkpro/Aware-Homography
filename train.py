@@ -6,7 +6,7 @@ Main training script for MultiPlaneHomographyNet.
 Usage:
     python train.py --config configs/default.yaml
     python train.py --config configs/default.yaml --resume checkpoints/epoch_010.pth
-    python train.py --config configs/my_config.yaml --gpu 1
+    python train.py --config configs/default.yaml --gpus 1,3
 
 After `pip install -e .`:
     dh-train --config configs/default.yaml
@@ -41,6 +41,21 @@ log = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Multi-GPU wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _TripletWrapper(nn.Module):
+    """Exposes forward_triplet as forward() so nn.DataParallel can scatter the batch."""
+
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, img_a, img_b, img_c, num_iters):
+        return self.model.forward_triplet(img_a, img_b, img_c, num_iters)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -48,7 +63,8 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Train MultiPlaneHomographyNet")
     p.add_argument("--config",  default="configs/default.yaml", help="YAML config path")
     p.add_argument("--resume",  default=None, help="Checkpoint path to resume from")
-    p.add_argument("--gpu",     type=int, default=0, help="GPU index (-1 = CPU)")
+    p.add_argument("--gpus",    default="0",
+                   help="Comma-separated physical GPU IDs to use, e.g. '1,3'  (default: '0')")
     p.add_argument("--workers", type=int, default=None, help="Override num_workers")
     return p.parse_args(argv)
 
@@ -132,10 +148,18 @@ def validate(model, val_loader, criterion, device, cfg, step, writer):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(cfg, args):
-    device = torch.device(
-        f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available() else "cpu"
-    )
-    log.info(f"Device: {device}")
+    # ── GPU / device setup ────────────────────────────────────────────────────
+    # Set CUDA_VISIBLE_DEVICES before any CUDA context is created so that
+    # physical GPU IDs are remapped to logical indices 0, 1, …
+    gpu_ids = [int(g.strip()) for g in args.gpus.split(",") if g.strip()]
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
+
+    use_cuda   = torch.cuda.is_available() and bool(gpu_ids)
+    device     = torch.device("cuda:0" if use_cuda else "cpu")
+    device_ids = list(range(len(gpu_ids))) if use_cuda and len(gpu_ids) > 1 else None
+
+    log.info(f"Physical GPUs: {gpu_ids}  →  primary device: {device}"
+             + (f"  |  DataParallel ids: {device_ids}" if device_ids else ""))
 
     if args.workers is not None:
         cfg["data"]["num_workers"] = args.workers
@@ -144,15 +168,22 @@ def train(cfg, args):
     val_loader   = build_val_loader(cfg)
     log.info(f"Train: {len(train_loader.dataset):,} triplets | Val: {len(val_loader.dataset):,}")
 
-    model = build_model(cfg).to(device)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # ── Model ─────────────────────────────────────────────────────────────────
+    raw_model = build_model(cfg).to(device)
+    n_params  = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
     log.info(f"Trainable parameters: {n_params:,}")
+
+    if device_ids is not None:
+        dp_model = nn.DataParallel(_TripletWrapper(raw_model), device_ids=device_ids)
+        log.info(f"DataParallel across logical GPU ids {device_ids}")
+    else:
+        dp_model = None  # single-GPU / CPU path
 
     criterion = TotalLoss(cfg)
     stn       = HomographySTN().to(device)
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        raw_model.parameters(),
         lr=cfg["train"]["lr"],
         betas=(cfg["train"]["beta1"], cfg["train"]["beta2"]),
         eps=cfg["train"]["eps"],
@@ -166,7 +197,7 @@ def train(cfg, args):
 
     start_epoch, global_step, best_error = 0, 0, float("inf")
     if args.resume:
-        ckpt = load_checkpoint(args.resume, model, optimizer, scheduler)
+        ckpt = load_checkpoint(args.resume, raw_model, optimizer, scheduler)
         start_epoch  = ckpt["epoch"] + 1
         global_step  = ckpt["global_step"]
         best_error   = ckpt["best_error"]
@@ -185,11 +216,11 @@ def train(cfg, args):
     log.info(f"Training for {max_epochs} epochs (warmup={warmup_epochs})...")
 
     for epoch in range(start_epoch, max_epochs):
-        model.set_warmup_mode(epoch < warmup_epochs)
+        raw_model.set_warmup_mode(epoch < warmup_epochs)
         if epoch < warmup_epochs:
             log.info(f"Epoch {epoch}: WARMUP stage (mask attention disabled)")
 
-        model.train()
+        (dp_model if dp_model is not None else raw_model).train()
         running = {k: 0.0 for k in ["total", "recon", "triplet", "geo", "triangle"]}
         n_batches = 0
         t0 = time.time()
@@ -200,10 +231,15 @@ def train(cfg, args):
             img_c = batch["img_c"].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            out    = model.forward_triplet(img_a, img_b, img_c, num_iters)
-            losses = criterion(out, img_a, img_b, img_c, model.feature_extractor, stn)
+
+            if dp_model is not None:
+                out = dp_model(img_a, img_b, img_c, num_iters)
+            else:
+                out = raw_model.forward_triplet(img_a, img_b, img_c, num_iters)
+
+            losses = criterion(out, img_a, img_b, img_c, raw_model.feature_extractor, stn)
             losses["total"].backward()
-            nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+            nn.utils.clip_grad_norm_(raw_model.parameters(), clip_norm)
             optimizer.step()
 
             for k in running:
@@ -237,18 +273,18 @@ def train(cfg, args):
         writer.add_scalar("train/lr", lr_now, global_step)
         scheduler.step()
 
-        val_error = validate(model, val_loader, criterion, device, cfg, global_step, writer)
+        val_error = validate(raw_model, val_loader, criterion, device, cfg, global_step, writer)
 
         if (epoch + 1) % save_interval == 0:
             save_checkpoint(
                 str(ckpt_dir / f"epoch_{epoch:03d}.pth"),
-                model, optimizer, scheduler, epoch, global_step, best_error,
+                raw_model, optimizer, scheduler, epoch, global_step, best_error,
             )
         if val_error < best_error:
             best_error = val_error
             save_checkpoint(
                 str(ckpt_dir / "best_model.pth"),
-                model, optimizer, scheduler, epoch, global_step, best_error,
+                raw_model, optimizer, scheduler, epoch, global_step, best_error,
             )
             log.info(f"  ↳ New best model (error={best_error:.4f})")
 

@@ -255,8 +255,14 @@ class MultiPlaneHomographyNet(nn.Module):
             [H_preds_all[k][-1] for k in range(self.num_planes)], dim=1
         )  # (B, K, 3, 3)
 
+        # Stack into a contiguous tensor so DataParallel can gather across GPUs.
+        # Shape: (B, K, num_iters, 3, 3)
+        H_preds = torch.stack(
+            [torch.stack(H_preds_all[k], dim=1) for k in range(self.num_planes)], dim=1
+        )
+
         return {
-            "H_preds":      H_preds_all,    # [K][num_iters] list of (B,3,3)
+            "H_preds":      H_preds,        # (B, K, num_iters, 3, 3)
             "H_final":      H_final,        # (B, K, 3, 3)
             "masks":        masks,          # (B, K, H/4, W/4)
             "feat_a_fine":  feat_a_fine,    # (B, C, H/4, W/4)

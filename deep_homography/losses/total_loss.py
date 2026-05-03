@@ -235,7 +235,7 @@ def triangle_consistency_loss(
 # ---------------------------------------------------------------------------
 
 def sequence_loss(
-    H_preds_all: List[List[torch.Tensor]],  # [K][num_iters] of (B, 3, 3)
+    H_preds:     torch.Tensor,              # (B, K, num_iters, 3, 3)
     img_a:       torch.Tensor,              # (B, 1, H, W)
     img_b:       torch.Tensor,              # (B, 1, H, W)
     feats_a:     torch.Tensor,              # (B, C, H_f, W_f)
@@ -254,13 +254,12 @@ def sequence_loss(
     This provides learning signal at every step of the GRU rollout,
     which significantly stabilises training versus only supervising the last.
     """
-    K = len(H_preds_all)
-    num_iters = len(H_preds_all[0])
+    _B, _K, num_iters, _, _ = H_preds.shape
     total = torch.tensor(0.0, device=img_a.device, requires_grad=True)
 
     for i in range(num_iters):
         weight = gamma ** (num_iters - i - 1)
-        H_iter = torch.stack([H_preds_all[k][i] for k in range(K)], dim=1)  # (B, K, 3, 3)
+        H_iter = H_preds[:, :, i, :, :]    # (B, K, 3, 3)
         loss_i = reconstruction_loss(
             img_a, img_b, feats_a, feats_b, masks, H_iter, feat_extractor, stn
         )
