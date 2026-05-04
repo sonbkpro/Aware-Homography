@@ -126,7 +126,7 @@ class TestDifferentiableDLT:
         assert err < 0.5, f"Zero flow DLT should be near identity, got err={err:.4f}"
 
     def test_gradients_flow(self):
-        """Gradients must flow through SVD."""
+        """Identity initialisation must keep DLT backward finite."""
         from deep_homography.models.differentiable_dlt import DifferentiableDLT
         dlt  = DifferentiableDLT(num_points=16)
         flow = torch.zeros(B, 2, 10, 18, requires_grad=True)
@@ -134,6 +134,8 @@ class TestDifferentiableDLT:
         H_out = dlt(flow, mask, 315, 560)
         H_out.sum().backward()
         assert flow.grad is not None, "Gradient did not flow through DLT"
+        assert torch.isfinite(H_out).all(), "DLT produced non-finite homography"
+        assert torch.isfinite(flow.grad).all(), "DLT backward produced non-finite gradients"
 
     def test_four_point_dlt(self):
         from deep_homography.models.differentiable_dlt import FourPointDLT

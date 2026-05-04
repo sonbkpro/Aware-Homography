@@ -21,6 +21,19 @@ import math
 from typing import Tuple
 
 
+def _safe_denominator(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Clamp tiny homogeneous denominators without destroying their sign.
+
+    Homographies are scale-ambiguous, so SVD-based solvers often return an
+    otherwise valid matrix with H[2,2] < 0. A plain clamp(min=eps) converts
+    every negative denominator to eps and can inflate near-identity transforms
+    by 1e8, which quickly poisons the loss with Inf/NaN.
+    """
+    sign = torch.where(x < 0, -torch.ones_like(x), torch.ones_like(x))
+    return sign * x.abs().clamp(min=eps)
+
+
 # ---------------------------------------------------------------------------
 # Spatial Transformer Network (STN) warping
 # ---------------------------------------------------------------------------
@@ -78,7 +91,7 @@ class HomographySTN(nn.Module):
         src_px = torch.bmm(grid_px, H_inv.permute(0, 2, 1))  # (B, H*W, 3)
 
         # Perspective divide
-        src_px = src_px / src_px[..., 2:3].clamp(min=1e-8)
+        src_px = src_px / _safe_denominator(src_px[..., 2:3])
 
         # Convert back to normalised [-1, 1] for grid_sample
         src_norm = self._pixel_to_norm(src_px[..., :2], height, width)  # (B, H*W, 2)
@@ -183,7 +196,7 @@ def H_compose(H1: torch.Tensor, H2: torch.Tensor) -> torch.Tensor:
     """
     H = torch.bmm(H2, H1)
     # Canonical normalisation
-    H = H / H[:, 2:3, 2:3].clamp(min=1e-8)
+    H = H / _safe_denominator(H[:, 2:3, 2:3])
     return H
 
 
@@ -196,7 +209,7 @@ def normalise_H(H: torch.Tensor) -> torch.Tensor:
     Returns:
         (B, 3, 3)
     """
-    return H / H[:, 2:3, 2:3].clamp(min=1e-8)
+    return H / _safe_denominator(H[:, 2:3, 2:3])
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +250,7 @@ def H_to_4corners(
     warped = torch.bmm(corners, H.permute(0, 2, 1))   # (B, 4, 3)
 
     # Perspective divide
-    warped = warped / warped[..., 2:3].clamp(min=1e-8)
+    warped = warped / _safe_denominator(warped[..., 2:3])
 
     # Displacement
     delta = warped[..., :2] - corners[..., :2]         # (B, 4, 2)
@@ -262,7 +275,7 @@ def warp_points(
     ones = torch.ones(B, N, 1, device=pts.device, dtype=pts.dtype)
     pts_h = torch.cat([pts, ones], dim=-1)              # (B, N, 3)
     warped = torch.bmm(pts_h, H.permute(0, 2, 1))       # (B, N, 3)
-    warped = warped / warped[..., 2:3].clamp(min=1e-8)
+    warped = warped / _safe_denominator(warped[..., 2:3])
     return warped[..., :2]
 
 

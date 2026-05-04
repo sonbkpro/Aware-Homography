@@ -8,11 +8,10 @@ This is the geometric heart of our architectural improvement over Zhang et al.
 we:
   1. Extract dense correspondences from the correlation volume (soft-argmax).
   2. Weight each correspondence by the plane mask M^k.
-  3. Solve the 8-DOF homography via a differentiable SVD.
+  3. Solve the 8-DOF homography via differentiable weighted least squares.
 
-Because torch.linalg.svd is fully differentiable, gradients flow back through
-the DLT solve into both the mask (M^k) and the feature extractor (through
-the soft-argmax correspondences).
+Gradients flow back through the DLT solve into both the mask (M^k) and the
+feature extractor (through the soft-argmax correspondences).
 
 Mathematical derivation:
     For N correspondences (x_i, y_i) → (x_i', y_i') with weights w_i,
@@ -28,11 +27,13 @@ Mathematical derivation:
         [-x  -y  -1   0   0   0  x'x  x'y  x'] h = 0
         [ 0   0   0  -x  -y  -1  y'x  y'y  y'] h = 0
 
-    The weighted system is M = Σ_i w_i A_i^T A_i,  where A_i is the 2×9
-    matrix above.  H = reshape(V[-1]), where V is from SVD(M).
+    We fix h9 = 1 and solve a regularised weighted least-squares system for
+    the remaining 8 homography parameters.  This avoids the unstable SVD
+    backward pass that appears when early identity correspondences produce
+    repeated singular values.
 
-    Tikhonov regularisation: M ← M + ε I   prevents rank deficiency when
-    weights collapse to zero in early training.
+    Tikhonov regularisation prevents rank deficiency when weights collapse to
+    zero in early training.
 
 Reference:
     DeTone et al. (2016) -- DLT parameterisation
@@ -45,6 +46,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Tuple, Optional
+
+
+def _safe_denominator(x: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Clamp tiny homography scale factors while preserving valid negatives."""
+    sign = torch.where(x < 0, -torch.ones_like(x), torch.ones_like(x))
+    return sign * x.abs().clamp(min=eps)
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +129,76 @@ def build_dlt_matrix(
     return M
 
 
+def build_weighted_lstsq_system(
+    src: torch.Tensor,     # (B, N, 2) normalised
+    dst: torch.Tensor,     # (B, N, 2) normalised
+    weights: torch.Tensor, # (B, N) soft weights in [0,1]
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build the fixed-scale weighted DLT system A h = b with h33 = 1.
+
+    The homogeneous 9-parameter SVD solve is mathematically elegant, but its
+    backward pass is unstable when the smallest singular values are repeated.
+    That happens at the start of training because the zero-initialised flow
+    head gives identity correspondences.  Fixing h33 = 1 gives a standard
+    8-parameter least-squares problem with a well-conditioned regularised
+    normal equation.
+    """
+    x, y = src[..., 0], src[..., 1]      # (B, N)
+    xp, yp = dst[..., 0], dst[..., 1]    # (B, N)
+    ones = torch.ones_like(x)
+    zeros = torch.zeros_like(x)
+
+    row1 = torch.stack(
+        [x, y, ones, zeros, zeros, zeros, -xp * x, -xp * y],
+        dim=-1,
+    )
+    row2 = torch.stack(
+        [zeros, zeros, zeros, x, y, ones, -yp * x, -yp * y],
+        dim=-1,
+    )
+    A = torch.cat([row1, row2], dim=1)            # (B, 2N, 8)
+    b = torch.cat([xp, yp], dim=1).unsqueeze(-1)  # (B, 2N, 1)
+
+    row_weights = weights.clamp_min(0.0).sqrt()
+    row_weights = torch.cat([row_weights, row_weights], dim=1).unsqueeze(-1)
+    return A * row_weights, b * row_weights
+
+
+def solve_weighted_lstsq(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    weights: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Solve for an h33=1 homography with regularised weighted least squares.
+
+    Returns:
+        H: (B, 3, 3) homography matrix in the same coordinate system as src/dst.
+    """
+    B = src.shape[0]
+    A, b = build_weighted_lstsq_system(src, dst, weights)
+    At = A.transpose(1, 2)
+    AtA = torch.bmm(At, A)
+    Atb = torch.bmm(At, b)
+
+    eye = torch.eye(8, device=src.device, dtype=src.dtype).unsqueeze(0)
+    h8 = torch.linalg.solve(AtA + eps * eye, Atb).squeeze(-1)
+
+    H = torch.empty(B, 3, 3, device=src.device, dtype=src.dtype)
+    H[:, 0, 0] = h8[:, 0]
+    H[:, 0, 1] = h8[:, 1]
+    H[:, 0, 2] = h8[:, 2]
+    H[:, 1, 0] = h8[:, 3]
+    H[:, 1, 1] = h8[:, 4]
+    H[:, 1, 2] = h8[:, 5]
+    H[:, 2, 0] = h8[:, 6]
+    H[:, 2, 1] = h8[:, 7]
+    H[:, 2, 2] = 1.0
+    return H
+
+
 def solve_dlt(M: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
     Solves M h = 0 for the homography vector h via SVD.
@@ -162,7 +239,7 @@ class DifferentiableDLT(nn.Module):
         1. Sample N correspondences from the flow field on a regular grid.
         2. Extract mask weights at the sampled locations.
         3. Hartley-normalise source and target points.
-        4. Build and solve the 9×9 weighted DLT system via SVD.
+        4. Build and solve the weighted DLT least-squares system.
         5. Denormalise: H = T_dst^{-1} H_norm T_src.
         6. Divide by H[2,2] so H is in canonical scale.
 
@@ -271,15 +348,14 @@ class DifferentiableDLT(nn.Module):
         dst_norm, T_dst = normalize_points(dst_img)  # (B, N, 2), (B, 3, 3)
 
         # ---- Build and solve DLT ----
-        M = build_dlt_matrix(src_norm, dst_norm, weights)   # (B, 9, 9)
-        H_norm = solve_dlt(M, eps=self.eps)                 # (B, 3, 3)
+        H_norm = solve_weighted_lstsq(src_norm, dst_norm, weights, eps=self.eps)
 
         # ---- Denormalise: H = T_dst^{-1} H_norm T_src ----
         T_dst_inv = torch.linalg.inv(T_dst)                 # (B, 3, 3)
         H = torch.bmm(T_dst_inv, torch.bmm(H_norm, T_src)) # (B, 3, 3)
 
         # ---- Canonical scale: divide by H[2,2] ----
-        scale_factor = H[:, 2, 2].unsqueeze(-1).unsqueeze(-1).clamp(min=1e-8)
+        scale_factor = _safe_denominator(H[:, 2, 2].view(B, 1, 1))
         H = H / scale_factor
 
         return H
@@ -326,9 +402,8 @@ class FourPointDLT(nn.Module):
 
         src_norm, T_src = normalize_points(src)
         dst_norm, T_dst = normalize_points(dst)
-        M = build_dlt_matrix(src_norm, dst_norm, weights)
-        H_norm = solve_dlt(M)
+        H_norm = solve_weighted_lstsq(src_norm, dst_norm, weights)
         T_dst_inv = torch.linalg.inv(T_dst)
         H = torch.bmm(T_dst_inv, torch.bmm(H_norm, T_src))
-        H = H / H[:, 2:3, 2:3].clamp(min=1e-8)
+        H = H / _safe_denominator(H[:, 2:3, 2:3])
         return H

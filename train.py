@@ -40,6 +40,16 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def _loss_debug_string(losses: dict) -> str:
+    parts = []
+    for name, value in losses.items():
+        if isinstance(value, torch.Tensor):
+            parts.append(f"{name}={value.detach().item():.6g}")
+        else:
+            parts.append(f"{name}={float(value):.6g}")
+    return ", ".join(parts)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,8 +212,15 @@ def train(cfg, args):
             optimizer.zero_grad(set_to_none=True)
             out    = model.forward_triplet(img_a, img_b, img_c, num_iters)
             losses = criterion(out, img_a, img_b, img_c, model.feature_extractor, stn)
+            if not torch.isfinite(losses["total"]):
+                raise FloatingPointError(
+                    f"Non-finite training loss at epoch={epoch}, step={global_step}: "
+                    f"{_loss_debug_string(losses)}"
+                )
             losses["total"].backward()
-            nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+            nn.utils.clip_grad_norm_(
+                model.parameters(), clip_norm, error_if_nonfinite=True
+            )
             optimizer.step()
 
             for k in running:
