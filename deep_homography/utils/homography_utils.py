@@ -275,29 +275,36 @@ def matrix_log_approx(M: torch.Tensor, num_terms: int = 10) -> torch.Tensor:
     Approximate matrix logarithm via Taylor series:
         log(M) ≈ log(I + (M - I)) = Σ_{n=1}^{N} (-1)^{n+1} (M-I)^n / n
 
-    Valid when ||M - I||_F << 1, which holds after the first few training
-    iterations when the inverse consistency loss starts working.
-
-    For large deviations, we fall back to the Frobenius-norm approximation
-    ||M - I||_F which is faster and more stable.
+    The Taylor series converges only when ||M - I||_F < 1.  For larger
+    deviations (common at the start of training) the series diverges to
+    Inf/NaN.  We therefore fall back to the first-order approximation
+    (M - I) — equivalent to the Frobenius consistency metric — whenever
+    ||M - I||_F >= 0.5.  This fallback is always finite and differentiable.
 
     Args:
         M:         (B, 3, 3) matrix (should be close to identity for log).
-        num_terms: Number of Taylor terms.
+        num_terms: Number of Taylor terms (used only in the convergent regime).
 
     Returns:
         (B, 3, 3) approximate log(M).
     """
     I = torch.eye(3, device=M.device, dtype=M.dtype).unsqueeze(0)
     X = M - I                           # (B, 3, 3)
+
     result = torch.zeros_like(M)
     power = X.clone()
-
     for n in range(1, num_terms + 1):
         result = result + ((-1) ** (n + 1)) / n * power
         power = torch.bmm(power, X)
 
-    return result
+    # Sanitise any Inf/NaN produced by diverged power iterations before blending.
+    result = torch.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Per-sample fallback: when ||X||_F >= 0.5 the series is unreliable;
+    # use the first-order approximation X (always finite, zero-grad through mask).
+    norm_X = X.detach().flatten(1).norm(dim=-1)          # (B,)
+    large  = (norm_X >= 0.5).float().view(-1, 1, 1)      # (B, 1, 1)
+    return large * X + (1.0 - large) * result
 
 
 def geodesic_distance(H1: torch.Tensor, H2: torch.Tensor) -> torch.Tensor:

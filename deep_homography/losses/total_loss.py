@@ -92,7 +92,7 @@ def reconstruction_loss(
     If K=1 this reduces exactly to Eq.4 of the original paper.
     """
     B, K, _, _ = masks.shape
-    total_loss = torch.tensor(0.0, device=img_a.device, requires_grad=True)
+    plane_losses = []
 
     for k in range(K):
         H_k = H_final[:, k]           # (B, 3, 3)
@@ -102,8 +102,7 @@ def reconstruction_loss(
         img_a_warped = stn(img_a, H_k)   # (B, 1, H, W)
 
         # Extract features of warped source (reuse the shared extractor)
-        with torch.enable_grad():
-            feats_a_warped = feat_extractor(img_a_warped)["level2"]  # (B, C, H_f, W_f)
+        feats_a_warped = feat_extractor(img_a_warped)["level2"]  # (B, C, H_f, W_f)
 
         # Warp source mask to get M'_a
         mask_k_up = F.interpolate(mask_k, size=img_a.shape[-2:], mode="bilinear", align_corners=False)
@@ -116,9 +115,9 @@ def reconstruction_loss(
         loss_fwd = masked_feature_l1(
             feats_a_warped, feats_b, mask_k_warped_feat, mask_k
         )
-        total_loss = total_loss + loss_fwd
+        plane_losses.append(loss_fwd)
 
-    return total_loss / K
+    return sum(plane_losses) / K
 
 
 # ---------------------------------------------------------------------------
@@ -179,10 +178,8 @@ def multi_plane_inverse_consistency(
     Per-plane geodesic inverse consistency, averaged over K planes.
     """
     K = H_ab_all.shape[1]
-    loss = torch.tensor(0.0, device=H_ab_all.device, requires_grad=True)
-    for k in range(K):
-        loss = loss + geodesic_inverse_consistency(H_ab_all[:, k], H_ba_all[:, k])
-    return loss / K
+    losses = [geodesic_inverse_consistency(H_ab_all[:, k], H_ba_all[:, k]) for k in range(K)]
+    return sum(losses) / K
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +207,7 @@ def triangle_consistency_loss(
     I = torch.eye(3, device=H_ab_all.device, dtype=H_ab_all.dtype)
     I = I.unsqueeze(0).expand(B, -1, -1)
 
-    loss = torch.tensor(0.0, device=H_ab_all.device, requires_grad=True)
+    plane_losses = []
     for k in range(K):
         H_ab = H_ab_all[:, k]   # (B, 3, 3)
         H_bc = H_bc_all[:, k]   # (B, 3, 3)
@@ -225,9 +222,9 @@ def triangle_consistency_loss(
         residual = normalise_H(residual)
 
         dist = geodesic_distance(I, residual)         # (B,)
-        loss = loss + dist.mean()
+        plane_losses.append(dist.mean())
 
-    return loss / K
+    return sum(plane_losses) / K
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +253,7 @@ def sequence_loss(
     """
     K = len(H_preds_all)
     num_iters = len(H_preds_all[0])
-    total = torch.tensor(0.0, device=img_a.device, requires_grad=True)
+    weighted = []
 
     for i in range(num_iters):
         weight = gamma ** (num_iters - i - 1)
@@ -264,9 +261,9 @@ def sequence_loss(
         loss_i = reconstruction_loss(
             img_a, img_b, feats_a, feats_b, masks, H_iter, feat_extractor, stn
         )
-        total = total + weight * loss_i
+        weighted.append(weight * loss_i)
 
-    return total
+    return sum(weighted)
 
 
 # ---------------------------------------------------------------------------

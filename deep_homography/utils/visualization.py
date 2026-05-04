@@ -47,8 +47,8 @@ def overlay_channels(
             t = t[0]
         return t.clamp(0, 1)
 
-    w = to_gray(img_warped).cpu().numpy()  # (H, W)
-    t = to_gray(img_target).cpu().numpy()  # (H, W)
+    w = np.nan_to_num(to_gray(img_warped).cpu().numpy(), nan=0.0)  # (H, W)
+    t = np.nan_to_num(to_gray(img_target).cpu().numpy(), nan=0.0)  # (H, W)
 
     # R = target, G = warped, B = warped
     out = np.stack([t, w, w], axis=-1)     # (H, W, 3)
@@ -86,10 +86,11 @@ def visualise_masks(
 
     canvas = np.zeros((H, W, 3), dtype=np.float32)
     for k in range(K):
-        m = masks[k].cpu().numpy()[:, :, np.newaxis]  # (H, W, 1)
+        m = np.nan_to_num(masks[k].cpu().numpy(), nan=0.0)[:, :, np.newaxis]  # (H, W, 1)
         colour = np.array(palette[k % len(palette)], dtype=np.float32) / 255.0
         canvas += m * colour
 
+    canvas = np.nan_to_num(canvas, nan=0.0)
     canvas = (canvas * 255).clip(0, 255).astype(np.uint8)
 
     # Blend with background
@@ -115,9 +116,9 @@ def flow_to_rgb(flow: np.ndarray) -> np.ndarray:
     magnitude = np.sqrt(u ** 2 + v ** 2)
     angle = np.arctan2(v, u)  # [-π, π]
 
-    hue = ((angle + np.pi) / (2 * np.pi) * 180).astype(np.float32)
+    hue = np.nan_to_num((angle + np.pi) / (2 * np.pi) * 180, nan=0.0).astype(np.float32)
     sat = np.ones_like(hue) * 255
-    val = (magnitude / (magnitude.max() + 1e-8) * 255).astype(np.float32)
+    val = np.nan_to_num(magnitude / (magnitude.max() + 1e-8) * 255, nan=0.0).astype(np.float32)
 
     hsv = np.stack([hue, sat, val], axis=-1).astype(np.uint8)
     rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
