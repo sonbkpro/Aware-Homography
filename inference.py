@@ -3,229 +3,385 @@ inference.py
 ============
 Complete inference pipeline for MultiPlaneHomographyNet.
 
-This module answers the key question:
-    "Given K=2 homography matrices at inference time, how do we warp
-     image A to align with image B?"
+KEY DESIGN DECISIONS (answers to the four questions):
 
-Answer: The PlaneMaskHead runs on every forward pass and produces the
-soft plane masks M^1...M^K alongside H^1...H^K. We use those masks
-as per-pixel weights to combine the K warped images.
+Q1 — What is warped_output.png?
+    Image A transformed by the estimated homography so its viewpoint matches
+    image B. Features (edges, corners, textures) in the warped output should
+    align spatially with those in image B. This is the primary product of
+    homography estimation — the input to panorama stitching, video
+    stabilisation, and visual odometry.
 
-Three strategies are provided, in order of sophistication:
+Q2 — Is the input cropped during inference?
+    YES. EvalTransform center-crops both images to (patch_height × patch_width),
+    e.g. 315×560, before passing them to the network. The warped output lives
+    in that cropped coordinate system. All visualisations therefore use the
+    CROPPED images as the reference, not the original full-resolution frames.
+    The original images are kept separately only for display context.
+    This file stores img_a_crop and img_b_crop explicitly to prevent
+    the shape mismatch bug that occurs when mixing original and cropped arrays.
 
-  Strategy 1 — Dominant plane  (simplest, one H for entire image)
-  Strategy 2 — Hard argmax     (per-pixel hard assignment, clean boundaries)
-  Strategy 3 — Soft blend      (per-pixel weighted average, smooth, differentiable)
+Q3 — What is comparison_grid.png?
+    A horizontal 6-panel strip at uniform resolution:
+      [Cropped A | Cropped B | A warped to B | Ghost overlay | Plane weights | Mask+boundaries]
+    - Ghost overlay: R=target, G+B=warped. Perfect alignment -> grey.
+      Misalignment -> red (target-only) or cyan (source-only) fringe.
+    - Plane masks: colour-coded by plane index (red=plane0, green=plane1).
+      Shows which plane owns each pixel at inference time.
 
-For most video stabilization / image alignment tasks, Strategy 3 is
-the correct choice.  Strategies 1 and 2 are provided for ablation and
-special cases (e.g. when one plane truly dominates the scene).
+Q4 — Mask visualisation is integrated directly (see visualise_masks and
+     visualise_masks_on_image functions below).
+
+Q5 — Bug fix: np.stack shape mismatch.
+    Root cause: img_b_np (original resolution e.g. 1080x1920) vs
+    warped_np (cropped resolution 315x560). The ghost function received
+    arrays with different spatial dimensions. Fixed by always passing
+    the cropped versions of img_a and img_b to all visualisation functions.
+
+Three blending strategies:
+  "dominant" - one global H (argmax by total mask support)
+  "argmax"   - per-pixel hard assignment to highest-weight plane
+  "soft"     - per-pixel weighted average (RECOMMENDED)
 """
 
+import argparse
+import sys
+from pathlib import Path
+from typing import Optional, Tuple
+
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-import cv2
-from pathlib import Path
-from typing import Tuple, Optional
+import yaml
 
-from deep_homography.models      import build_model, MultiPlaneHomographyNet
-from deep_homography.utils       import HomographySTN
 from deep_homography.data.augmentations import EvalTransform
+from deep_homography.models import MultiPlaneHomographyNet, build_model
+from deep_homography.utils import HomographySTN
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Core warping strategies
+# Preprocessing: crop exactly as EvalTransform does, keep cropped numpy arrays
+# ─────────────────────────────────────────────────────────────────────────────
+
+def preprocess_pair(
+    img_a_np:  np.ndarray,
+    img_b_np:  np.ndarray,
+    transform: EvalTransform,
+    device:    torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray, np.ndarray]:
+    """
+    Apply EvalTransform to both images and also return the CROPPED uint8
+    numpy arrays so that all downstream visualisation works in the same
+    coordinate system as the model output.
+
+    Returns:
+        img_a_t:    (1, C, H_crop, W_crop) tensor, normalised
+        img_b_t:    (1, C, H_crop, W_crop) tensor, normalised
+        img_a_crop: (H_crop, W_crop, 3)    BGR uint8 cropped source
+        img_b_crop: (H_crop, W_crop, 3)    BGR uint8 cropped target
+    """
+    crop_h = transform.crop_h
+    crop_w = transform.crop_w
+
+    def _center_crop_bgr(img: np.ndarray) -> np.ndarray:
+        h, w = img.shape[:2]
+        if h < crop_h or w < crop_w:
+            scale = max(crop_h / h, crop_w / w)
+            img = cv2.resize(img, (int(w * scale) + 1, int(h * scale) + 1))
+            h, w = img.shape[:2]
+        top  = (h - crop_h) // 2
+        left = (w - crop_w) // 2
+        return img[top: top + crop_h, left: left + crop_w].copy()
+
+    img_a_crop = _center_crop_bgr(img_a_np)
+    img_b_crop = _center_crop_bgr(img_b_np)
+
+    # EvalTransform expects BGR uint8 frames as a list; third frame is a dummy
+    tensors = transform([img_a_np, img_b_np, img_b_np])
+    img_a_t = tensors[0].unsqueeze(0).to(device)
+    img_b_t = tensors[1].unsqueeze(0).to(device)
+
+    return img_a_t, img_b_t, img_a_crop, img_b_crop
+
+
+def tensor_to_bgr(
+    tensor: torch.Tensor,
+    mean:   float = 0.485,
+    std:    float = 0.229,
+) -> np.ndarray:
+    """Denormalise a model-output tensor and convert to BGR uint8 numpy."""
+    t = tensor.detach().cpu().float()
+    t = (t * std + mean).clamp(0.0, 1.0)
+    if t.shape[0] == 1:
+        t = t.repeat(3, 1, 1)
+    np_rgb = (t.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    return cv2.cvtColor(np_rgb, cv2.COLOR_RGB2BGR)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Warping strategies
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def warp_multiplane(
-    img_a:   torch.Tensor,    # (B, C, H, W)  source image, normalised
-    H_all:   torch.Tensor,    # (B, K, 3, 3)  one homography per plane
-    masks:   torch.Tensor,    # (B, K, Hf, Wf) plane masks (sum-to-1 over K)
-    strategy: str = "soft",   # "dominant" | "argmax" | "soft"
-    stn:     Optional[HomographySTN] = None,
+    img_a_t:  torch.Tensor,
+    H_all:    torch.Tensor,
+    masks:    torch.Tensor,
+    strategy: str = "soft",
+    stn:      Optional[HomographySTN] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Warp image A using K homographies weighted by K plane masks.
+    Warp image A using K homographies blended by K plane masks.
 
-    Args:
-        img_a:    (B, C, H, W)  source image tensor (normalised).
-        H_all:    (B, K, 3, 3)  per-plane homography matrices.
-        masks:    (B, K, Hf, Wf) soft plane masks, softmax over K dimension.
-        strategy: Which blending strategy to use (see module docstring).
-        stn:      Optional pre-created HomographySTN (avoids re-creation).
+    Strategy "soft" (RECOMMENDED):
+        output(p) = sum_k  M^k(p) * warp(A, H^k)[p]
+        Convex combination at every pixel. Differentiable. Smooth transitions.
+
+    Strategy "argmax":
+        k*(p) = argmax_k M^k(p); output(p) = warp(A, H^{k*})[p]
+        Hard per-pixel region selection. Clean boundaries, no ghosting at
+        edges. Not differentiable.
+
+    Strategy "dominant":
+        k* = argmax_k sum_p M^k(p); uses H^{k*} for the whole image.
+        One global homography. Fastest. Use when one plane dominates.
 
     Returns:
-        warped:  (B, C, H, W)  image A warped to align with B.
-        weights: (B, K, H, W)  per-pixel plane weights used (for visualisation).
+        warped:  (B, C, H, W) warped image tensor
+        weights: (B, K, H, W) per-pixel plane weights actually applied
     """
     if stn is None:
         stn = HomographySTN()
 
     B, K, _, _ = H_all.shape
-    _, C, H, W = img_a.shape
+    _, C, H, W = img_a_t.shape
 
-    # Upsample masks to full image resolution
     masks_full = F.interpolate(
         masks, size=(H, W), mode="bilinear", align_corners=False
-    )  # (B, K, H, W) — still sums to 1 over K dim
+    )  # (B, K, H, W), sums to 1 over dim=1
 
     if strategy == "dominant":
-        return _strategy_dominant(img_a, H_all, masks_full, stn)
+        return _warp_dominant(img_a_t, H_all, masks_full, stn)
     elif strategy == "argmax":
-        return _strategy_argmax(img_a, H_all, masks_full, stn)
+        return _warp_argmax(img_a_t, H_all, masks_full, stn)
     elif strategy == "soft":
-        return _strategy_soft_blend(img_a, H_all, masks_full, stn)
+        return _warp_soft(img_a_t, H_all, masks_full, stn)
     else:
-        raise ValueError(f"Unknown strategy '{strategy}'. Choose: dominant | argmax | soft")
+        raise ValueError(f"Unknown strategy '{strategy}'. Choose: soft | argmax | dominant")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Strategy 1: Dominant plane
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _strategy_dominant(img_a, H_all, masks_full, stn):
-    """
-    Select one global homography: the plane k* with the most mask support.
-
-        k* = argmax_k  Σ_{pixels} M^k(p)
-
-    Then warp the entire image with H^{k*}.
-
-    When to use:
-        - Scene has one overwhelmingly dominant plane (textbook homography case).
-        - You need a single 3×3 matrix as output (e.g. for downstream stitching).
-        - Fast inference where simplicity matters.
-
-    Limitation:
-        Ignores all information from the other K-1 planes. If there is a
-        foreground object on a different plane (e.g. a person walking in front
-        of a building), that region will be misaligned.
-    """
-    B, K, H, W = masks_full.shape
-
-    # Total spatial support per plane: (B, K)
-    support = masks_full.flatten(2).sum(dim=-1)
-    dominant_k = support.argmax(dim=1)   # (B,)
-
-    # Select the dominant H for each sample in the batch
-    H_dominant = H_all[torch.arange(B, device=H_all.device), dominant_k]  # (B, 3, 3)
-    warped = stn(img_a, H_dominant)  # (B, C, H, W)
-
-    # Build weight map: 1 at dominant plane pixels, 0 elsewhere (for vis)
+def _warp_dominant(img_a_t, H_all, masks_full, stn):
+    B = img_a_t.shape[0]
+    support    = masks_full.flatten(2).sum(dim=-1)
+    dominant_k = support.argmax(dim=1)
+    H_dom  = H_all[torch.arange(B, device=H_all.device), dominant_k]
+    warped = stn(img_a_t, H_dom)
     weights = torch.zeros_like(masks_full)
     for b in range(B):
         weights[b, dominant_k[b]] = 1.0
-
     return warped, weights
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Strategy 2: Hard argmax
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _strategy_argmax(img_a, H_all, masks_full, stn):
-    """
-    At every pixel p, choose the plane with the highest mask weight:
-
-        k*(p) = argmax_k  M^k(p)
-
-    Then composite: output(p) = warp(A, H^{k*(p)})[p]
-
-    This is equivalent to partitioning the image into K disjoint regions,
-    each warped by its own homography. Boundaries are sharp.
-
-    When to use:
-        - The planes are physically distinct (e.g. sky vs ground).
-        - You want clean region boundaries without ghosting.
-        - You are doing region-based compositing downstream.
-
-    Limitation:
-        Hard boundaries can cause visible seams if mask edges are noisy.
-        Masking with argmax is not differentiable (can't be used in training loss).
-    """
+def _warp_argmax(img_a_t, H_all, masks_full, stn):
     B, K, H, W = masks_full.shape
-
-    # Warp image separately for each plane
-    warped_planes = []
-    for k in range(K):
-        H_k = H_all[:, k]               # (B, 3, 3)
-        warped_k = stn(img_a, H_k)      # (B, C, H, W)
-        warped_planes.append(warped_k)
-    warped_stack = torch.stack(warped_planes, dim=1)  # (B, K, C, H, W)
-
-    # Hard assignment: (B, H, W) with values in {0, ..., K-1}
-    assignment = masks_full.argmax(dim=1)  # (B, H, W)
-
-    # Build one-hot weight map: (B, K, H, W)
-    weights = F.one_hot(assignment, num_classes=K).float()   # (B, H, W, K)
-    weights = weights.permute(0, 3, 1, 2)                    # (B, K, H, W)
-
-    # Composite: sum over K (only one plane is 1 at each pixel)
-    # weights: (B, K, H, W) → unsqueeze channel dim → (B, K, 1, H, W)
-    w = weights.unsqueeze(2)                      # (B, K, 1, H, W)
-    warped = (warped_stack * w).sum(dim=1)        # (B, C, H, W)
-
+    warped_planes = torch.stack(
+        [stn(img_a_t, H_all[:, k]) for k in range(K)], dim=1
+    )  # (B, K, C, H, W)
+    assignment = masks_full.argmax(dim=1)
+    weights    = F.one_hot(assignment, K).float().permute(0, 3, 1, 2)
+    warped     = (warped_planes * weights.unsqueeze(2)).sum(dim=1)
     return warped, weights
 
 
+def _warp_soft(img_a_t, H_all, masks_full, stn):
+    warped = torch.zeros_like(img_a_t)
+    for k in range(H_all.shape[1]):
+        w_k    = masks_full[:, k].unsqueeze(1)
+        warped = warped + w_k * stn(img_a_t, H_all[:, k])
+    return warped, masks_full
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Strategy 3: Soft blend  ← RECOMMENDED
+# Visualisation  (all functions operate on CROPPED BGR arrays)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _strategy_soft_blend(img_a, H_all, masks_full, stn):
+_PLANE_COLOURS_BGR = [
+    ( 50,  50, 255),   # red    plane 0
+    ( 50, 200,  50),   # green  plane 1
+    (255,  50,  50),   # blue   plane 2
+    ( 30, 165, 255),   # amber  plane 3
+]
+
+
+def ghost_overlay(warped_bgr: np.ndarray, target_bgr: np.ndarray) -> np.ndarray:
     """
-    At every pixel p, take the weighted average of all K warped images:
+    Red/green ghost overlay.
 
-        output(p) = Σ_k  M^k(p) · warp(A, H^k)[p]
+    Both inputs MUST be the same spatial size — always pass cropped images.
 
-    Because masks sum to 1 (partition of unity), this is a proper convex
-    combination: the output pixel is a weighted average of the K candidate
-    aligned pixels. No pixel is discarded.
-
-    When to use:
-        - General case (recommended default).
-        - The planes overlap spatially (common in real scenes).
-        - Smooth transitions between plane regions are desired.
-        - The result will be used in a differentiable downstream step.
-
-    Mathematical guarantee:
-        If M^k(p) ≈ 1 for some k (sharp mask), this reduces exactly to
-        Strategy 2 at that pixel. If M^k(p) = 1/K everywhere (uniform mask),
-        it produces a ghostly average — this only happens if the mask head
-        has not trained properly.
-
-    Ghosting concern:
-        At boundary pixels where M¹ ≈ M² ≈ 0.5, the two warped images
-        are averaged equally, which can appear as a half-transparent double
-        exposure. This is the cost of smoothness. The entropy loss during
-        training pushes masks toward hard assignments precisely to prevent this.
-        If ghosting persists, increase lambda_mask_entropy in config.
+    R = target,  G = B = warped.
+    Perfect alignment -> grey. Misalignment -> red/cyan fringe.
     """
-    B, K, H, W = masks_full.shape
+    assert warped_bgr.shape == target_bgr.shape, (
+        f"ghost_overlay: shape mismatch warped={warped_bgr.shape} "
+        f"vs target={target_bgr.shape}. Always pass the center-cropped images."
+    )
+    w = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    t = cv2.cvtColor(target_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    rgb = np.stack([t, w, w], axis=-1)          # (H, W, 3) in RGB order
+    rgb = (rgb * 255).clip(0, 255).astype(np.uint8)
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-    # Accumulate the weighted sum
-    warped_blend = torch.zeros_like(img_a)  # (B, C, H, W)
 
+def visualise_masks(
+    masks_np:   np.ndarray,
+    background: Optional[np.ndarray] = None,
+    alpha:      float = 0.6,
+) -> np.ndarray:
+    """
+    Colour-coded K-plane mask visualisation.
+
+    Each plane gets a unique colour. The colour at pixel p is the weighted
+    sum of plane colours by M^k(p), so boundaries blend smoothly.
+
+    Args:
+        masks_np:   (K, H, W) float in [0, 1].
+        background: (H, W, 3) BGR uint8 to blend underneath (optional).
+        alpha:      Opacity of the colour layer.
+
+    Returns:
+        (H, W, 3) BGR uint8.
+    """
+    K, H, W = masks_np.shape
+    canvas = np.zeros((H, W, 3), dtype=np.float32)
     for k in range(K):
-        H_k      = H_all[:, k]                          # (B, 3, 3)
-        warped_k = stn(img_a, H_k)                      # (B, C, H, W)
-        mask_k   = masks_full[:, k].unsqueeze(1)        # (B, 1, H, W)
-        warped_blend = warped_blend + mask_k * warped_k
+        colour = np.array(_PLANE_COLOURS_BGR[k % len(_PLANE_COLOURS_BGR)],
+                          dtype=np.float32) / 255.0
+        canvas += masks_np[k, :, :, np.newaxis] * colour
 
-    return warped_blend, masks_full
+    mask_vis = (canvas * 255).clip(0, 255).astype(np.uint8)
+
+    if background is not None:
+        bg = cv2.resize(background, (W, H)).astype(np.uint8)
+        mask_vis = cv2.addWeighted(bg, 1.0 - alpha, mask_vis, alpha, 0)
+
+    return mask_vis
+
+
+def visualise_masks_on_image(
+    img_bgr:   np.ndarray,
+    masks_np:  np.ndarray,
+    alpha:     float = 0.55,
+    border_px: int = 2,
+) -> np.ndarray:
+    """
+    Overlay plane-mask colours on the source image WITH per-plane region
+    boundaries drawn at argmax decision transitions.
+
+    Args:
+        img_bgr:   (H, W, 3) BGR uint8 — the CROPPED source image.
+        masks_np:  (K, H, W) float plane masks.
+        alpha:     Opacity of the colour overlay.
+        border_px: Width of the region-boundary contour.
+
+    Returns:
+        (H, W, 3) BGR uint8.
+    """
+    K, H, W = masks_np.shape
+    overlay = visualise_masks(masks_np, background=None, alpha=1.0)
+    bg = cv2.resize(img_bgr, (W, H)).astype(np.uint8)
+    blended = cv2.addWeighted(bg, 1 - alpha, overlay, alpha, 0)
+
+    assignment = masks_np.argmax(axis=0).astype(np.uint8)
+    for k in range(K):
+        region_k = (assignment == k).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(region_k, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(blended, contours, -1,
+                         _PLANE_COLOURS_BGR[k % len(_PLANE_COLOURS_BGR)],
+                         border_px)
+    return blended
+
+
+def make_comparison_grid(
+    img_a_crop:  np.ndarray,
+    img_b_crop:  np.ndarray,
+    warped_bgr:  np.ndarray,
+    masks_np:    np.ndarray,
+    weights_np:  np.ndarray,
+) -> np.ndarray:
+    """
+    Build a labelled 6-panel comparison strip. All inputs must be the same
+    spatial resolution (H_crop x W_crop) — pass the center-cropped images.
+
+    Panels:
+        1. Cropped source A
+        2. Cropped target B
+        3. A warped to B  (warped_output.png content)
+        4. Ghost overlay  (alignment quality indicator)
+        5. Soft plane weights on source
+        6. Mask overlay with region boundaries
+
+    Returns:
+        BGR uint8 canvas with header labels.
+    """
+    H, W = warped_bgr.shape[:2]
+
+    def _to_bgr3(img: np.ndarray) -> np.ndarray:
+        img = cv2.resize(img.astype(np.uint8), (W, H))
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif img.shape[2] == 1:
+            img = cv2.cvtColor(img[:, :, 0], cv2.COLOR_GRAY2BGR)
+        return img
+
+    a = _to_bgr3(img_a_crop)
+    b = _to_bgr3(img_b_crop)
+    w = _to_bgr3(warped_bgr)
+
+    # Ghost: both w and b are now guaranteed (H, W, 3)
+    gh = ghost_overlay(w, b)
+
+    # Soft mask colours blended over source
+    mp = _to_bgr3(visualise_masks(weights_np, background=a, alpha=0.6))
+
+    # Mask + boundary contours on source
+    bp = _to_bgr3(visualise_masks_on_image(a, masks_np))
+
+    row = np.concatenate([a, b, w, gh, mp, bp], axis=1)
+
+    labels = [
+        "Source A (cropped)",
+        "Target B (cropped)",
+        "A warped to B",
+        "Ghost overlay",
+        "Plane weights",
+        "Mask + boundaries",
+    ]
+    hdr_h  = 32
+    header = np.zeros((hdr_h, row.shape[1], 3), dtype=np.uint8)
+    sep    = (80, 80, 80)
+    for i, lbl in enumerate(labels):
+        tx = max(4, i * W + W // 2 - len(lbl) * 4)
+        cv2.putText(header, lbl, (tx, 21),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1, cv2.LINE_AA)
+        if i > 0:
+            cv2.line(header, (i * W, 0), (i * W, hdr_h), sep, 1)
+            cv2.line(row,    (i * W, 0), (i * W, H),     sep, 1)
+
+    return np.vstack([header, row])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# High-level inference function (use this in practice)
+# High-level inference function
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def infer_pair(
     model:      MultiPlaneHomographyNet,
-    img_a_np:   np.ndarray,          # BGR uint8, any resolution
-    img_b_np:   np.ndarray,          # BGR uint8 (used only for visual comparison)
+    img_a_np:   np.ndarray,
+    img_b_np:   np.ndarray,
     transform:  EvalTransform,
     device:     torch.device,
     num_iters:  int = 24,
@@ -235,183 +391,92 @@ def infer_pair(
     Full inference on a single image pair.
 
     Args:
-        model:      Trained MultiPlaneHomographyNet.
-        img_a_np:   Source image (BGR uint8).
-        img_b_np:   Target image (BGR uint8).
-        transform:  EvalTransform (crops + normalises).
+        model:      Trained MultiPlaneHomographyNet (model.eval() called inside).
+        img_a_np:   Source image, BGR uint8, any resolution.
+        img_b_np:   Target image, BGR uint8, any resolution.
+        transform:  EvalTransform (handles crop + normalisation).
         device:     Torch device.
-        num_iters:  GRU refinement iterations (more = slower but better).
-        strategy:   Blending strategy: "soft" | "argmax" | "dominant".
+        num_iters:  GRU refinement iterations.
+        strategy:   "soft" | "argmax" | "dominant"
 
-    Returns dict with:
-        'warped_np'    : np.ndarray (H, W, 3) BGR uint8 — A warped to B
-        'H_all'        : (K, 3, 3) numpy — all K homography matrices
-        'masks_np'     : (K, H, W) numpy — plane masks at full resolution
-        'weights_np'   : (K, H, W) numpy — actual per-pixel blend weights used
-        'dominant_k'   : int — index of dominant plane
+    Returns dict with keys:
+        "warped_bgr"  : (H_crop, W_crop, 3) BGR uint8 — A warped to B
+        "img_a_crop"  : (H_crop, W_crop, 3) BGR uint8 — cropped source
+        "img_b_crop"  : (H_crop, W_crop, 3) BGR uint8 — cropped target
+        "H_all"       : (K, 3, 3) float64 numpy — all K homography matrices
+        "masks_np"    : (K, H_crop, W_crop) float32 — soft masks at image res
+        "weights_np"  : (K, H_crop, W_crop) float32 — actual blend weights used
+        "dominant_k"  : int — index of the plane with most spatial support
     """
     model.eval()
     stn = HomographySTN().to(device)
 
-    # Preprocess: EvalTransform returns a list of tensors
-    imgs = transform([img_a_np, img_b_np, img_b_np])   # 3rd is dummy for triplet API
-    img_a_t = imgs[0].unsqueeze(0).to(device)           # (1, 1, H, W)
-    img_b_t = imgs[1].unsqueeze(0).to(device)
+    img_a_t, img_b_t, img_a_crop, img_b_crop = preprocess_pair(
+        img_a_np, img_b_np, transform, device
+    )
+    _, _, H_crop, W_crop = img_a_t.shape
 
-    # ── Forward pass ─────────────────────────────────────────────────────────
-    out = model.forward(img_a_t, img_b_t, num_iters=num_iters)
-    #
-    # out["H_final"]:   (1, K, 3, 3)  per-plane homographies
-    # out["masks"]:     (1, K, Hf, Wf) plane masks (softmax over K)
-    # out["flow_init"]: (1, 2, Hf, Wf) initial soft-argmax flow (diagnostic)
-    #
+    out   = model.forward(img_a_t, img_b_t, num_iters=num_iters)
     H_all = out["H_final"]   # (1, K, 3, 3)
     masks = out["masks"]     # (1, K, Hf, Wf)
 
-    # ── Warp using chosen strategy ───────────────────────────────────────────
-    warped, weights = warp_multiplane(
+    warped_t, weights_t = warp_multiplane(
         img_a_t, H_all, masks, strategy=strategy, stn=stn
-    )  # warped: (1, 1, H, W),  weights: (1, K, H, W)
+    )
 
-    # ── Convert back to uint8 BGR numpy ──────────────────────────────────────
-    warped_np = _tensor_to_bgr_uint8(warped[0], transform)
+    warped_bgr = tensor_to_bgr(warped_t[0], transform.mean, transform.std)
 
-    # Dominant plane (by total mask support)
-    support   = masks[0].flatten(1).sum(dim=-1)   # (K,)
-    dominant_k = support.argmax().item()
+    def _up(t):
+        return F.interpolate(
+            t, size=(H_crop, W_crop), mode="bilinear", align_corners=False
+        )[0].cpu().numpy()
+
+    masks_np   = _up(masks)
+    weights_np = _up(weights_t)
+
+    support    = masks[0].flatten(1).sum(dim=-1)
+    dominant_k = int(support.argmax().item())
 
     return {
-        "warped_np":    warped_np,                                   # (H, W, 3) BGR uint8
-        "H_all":        H_all[0].cpu().numpy(),                      # (K, 3, 3)
-        "masks_np":     _upsample_masks(masks[0], img_a_np),        # (K, H, W) float
-        "weights_np":   _upsample_masks(weights[0], img_a_np),      # (K, H, W) float
-        "dominant_k":   dominant_k,
+        "warped_bgr":  warped_bgr,
+        "img_a_crop":  img_a_crop,
+        "img_b_crop":  img_b_crop,
+        "H_all":       H_all[0].cpu().numpy(),
+        "masks_np":    masks_np,
+        "weights_np":  weights_np,
+        "dominant_k":  dominant_k,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _tensor_to_bgr_uint8(
-    tensor:    torch.Tensor,   # (C, H, W) normalised
-    transform: EvalTransform,
-) -> np.ndarray:
-    """Denormalise and convert to BGR uint8."""
-    t = tensor.cpu().float()
-    t = t * transform.std + transform.mean   # undo normalisation
-    t = t.clamp(0, 1)
-    if t.shape[0] == 1:
-        t = t.repeat(3, 1, 1)               # grayscale → 3-channel
-    np_img = (t.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-    return cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Multi-plane homography inference",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Strategies:\n"
+            "  soft     — per-pixel weighted average (recommended)\n"
+            "  argmax   — hard per-pixel plane assignment\n"
+            "  dominant — one global H for the whole image\n"
+        ),
+    )
+    p.add_argument("--img_a",      required=True)
+    p.add_argument("--img_b",      required=True)
+    p.add_argument("--checkpoint", required=True)
+    p.add_argument("--config",     default="configs/default.yaml")
+    p.add_argument("--strategy",   default="soft",
+                   choices=["soft", "argmax", "dominant"])
+    p.add_argument("--num_iters",  type=int, default=24)
+    p.add_argument("--out_dir",    default="inference_output")
+    p.add_argument("--gpu",        type=int, default=0)
+    return p.parse_args(argv)
 
-
-def _upsample_masks(
-    masks: torch.Tensor,    # (K, Hf, Wf)
-    ref_img: np.ndarray,    # BGR reference for target resolution
-) -> np.ndarray:
-    H, W = ref_img.shape[:2]
-    m = F.interpolate(
-        masks.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
-    ).squeeze(0)            # (K, H, W)
-    return m.cpu().numpy()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Visualisation helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def make_comparison_grid(
-    img_a_np:   np.ndarray,   # BGR uint8
-    img_b_np:   np.ndarray,   # BGR uint8
-    warped_np:  np.ndarray,   # BGR uint8
-    masks_np:   np.ndarray,   # (K, H, W) float
-) -> np.ndarray:
-    """
-    Builds a side-by-side visualisation:
-
-        [ Image A | Image B | Warped A | Ghost overlay | Plane masks ]
-
-    Args:
-        img_a_np:  Source image.
-        img_b_np:  Target image.
-        warped_np: Warped source image.
-        masks_np:  (K, H, W) plane masks.
-
-    Returns:
-        np.ndarray BGR uint8 canvas.
-    """
-    H, W = img_a_np.shape[:2]
-
-    # Ghost overlay: R = target, G+B = warped (misalignment shows as colour fringe)
-    def _ghost(warped, target):
-        w = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY).astype(float) / 255
-        t = cv2.cvtColor(target, cv2.COLOR_BGR2GRAY).astype(float) / 255
-        out = np.stack([t, w, w], axis=-1)
-        return (out * 255).clip(0, 255).astype(np.uint8)
-
-    ghost = _ghost(warped_np, img_b_np)
-
-    # Colour-coded K-plane mask
-    palette = [
-        (255,  50,  50),   # red   plane 0
-        ( 50, 200,  50),   # green plane 1
-        ( 50,  50, 255),   # blue  plane 2
-        (255, 165,   0),   # amber plane 3
-    ]
-    K = masks_np.shape[0]
-    mask_vis = np.zeros((H, W, 3), dtype=np.float32)
-    for k in range(K):
-        c = np.array(palette[k % len(palette)], dtype=np.float32) / 255
-        mask_vis += masks_np[k, :, :, np.newaxis] * c
-    mask_vis = (mask_vis * 255).clip(0, 255).astype(np.uint8)
-
-    # Combine: resize all to same height (crop may have changed size)
-    def _resize(img):
-        return cv2.resize(img, (W, H))
-
-    row = np.concatenate([
-        _resize(img_a_np),
-        _resize(img_b_np),
-        _resize(warped_np),
-        _resize(ghost),
-        _resize(mask_vis),
-    ], axis=1)
-
-    # Add labels at top
-    labels = ["Source A", "Target B", "Warped A", "Ghost overlay", "Plane masks"]
-    label_row = np.zeros((28, row.shape[1], 3), dtype=np.uint8)
-    for i, lbl in enumerate(labels):
-        x = i * W + W // 2
-        cv2.putText(label_row, lbl, (x - 55, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-
-    return np.vstack([label_row, row])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI demo entry point
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    import argparse
-    import yaml
-
-    p = argparse.ArgumentParser(description="Multi-plane homography inference")
-    p.add_argument("--img_a",       required=True,  help="Source image path")
-    p.add_argument("--img_b",       required=True,  help="Target image path")
-    p.add_argument("--checkpoint",  required=True,  help="Model checkpoint path")
-    p.add_argument("--config",      default="configs/default.yaml")
-    p.add_argument("--strategy",    default="soft",
-                   choices=["soft", "argmax", "dominant"],
-                   help="Blending strategy (default: soft)")
-    p.add_argument("--num_iters",   type=int, default=24)
-    p.add_argument("--out",         default="warped_output.png")
-    p.add_argument("--grid",        default="comparison_grid.png",
-                   help="Side-by-side comparison image")
-    p.add_argument("--gpu",         type=int, default=0)
-    args = p.parse_args()
+    args = parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
@@ -420,16 +485,11 @@ def main():
         f"cuda:{args.gpu}" if args.gpu >= 0 and torch.cuda.is_available() else "cpu"
     )
 
-    # Load model
     model = build_model(cfg).to(device)
     ckpt  = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt.get("model", ckpt))
-    print(f"Loaded checkpoint: {args.checkpoint}")
-
-    # Load images
-    img_a = cv2.imread(args.img_a)
-    img_b = cv2.imread(args.img_b)
-    assert img_a is not None and img_b is not None, "Could not read images."
+    model.eval()
+    print(f"Loaded: {args.checkpoint}")
 
     transform = EvalTransform(
         crop_h=cfg["data"]["patch_height"],
@@ -439,28 +499,50 @@ def main():
         std=cfg["data"]["normalize_std"],
     )
 
-    # Run inference
+    img_a = cv2.imread(args.img_a)
+    img_b = cv2.imread(args.img_b)
+    if img_a is None:
+        sys.exit(f"Cannot read: {args.img_a}")
+    if img_b is None:
+        sys.exit(f"Cannot read: {args.img_b}")
+
+    print(f"Source: {img_a.shape}  ->  crop to "
+          f"{cfg['data']['patch_height']}x{cfg['data']['patch_width']}")
+
     result = infer_pair(
         model, img_a, img_b, transform, device,
         num_iters=args.num_iters,
         strategy=args.strategy,
     )
 
-    # Save warped image
-    cv2.imwrite(args.out, result["warped_np"])
-    print(f"Warped image saved → {args.out}")
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Print homographies
+    cv2.imwrite(str(out_dir / "warped_output.png"),   result["warped_bgr"])
+    cv2.imwrite(str(out_dir / "plane_masks.png"),
+                visualise_masks(result["masks_np"], background=result["img_a_crop"]))
+    cv2.imwrite(str(out_dir / "masks_on_source.png"),
+                visualise_masks_on_image(result["img_a_crop"], result["masks_np"]))
+    cv2.imwrite(str(out_dir / "comparison_grid.png"),
+                make_comparison_grid(
+                    result["img_a_crop"], result["img_b_crop"],
+                    result["warped_bgr"], result["masks_np"], result["weights_np"],
+                ))
+
     K = result["H_all"].shape[0]
-    print(f"\nDominant plane: k={result['dominant_k']}")
+    print(f"\nStrategy : {args.strategy}")
+    print("Plane support: " + ", ".join(
+        f"k{k}={result['masks_np'][k].mean()*100:.1f}%"
+        for k in range(K)
+    ))
     for k in range(K):
-        print(f"\nH^{k} =\n{np.round(result['H_all'][k], 4)}")
+        print(f"\nH^{k} =\n{np.round(result['H_all'][k], 5)}")
 
-    # Save comparison grid
-    grid = make_comparison_grid(img_a, img_b, result["warped_np"], result["masks_np"])
-    cv2.imwrite(args.grid, grid)
-    print(f"Comparison grid saved → {args.grid}")
-    print("\nColumns: [Source A | Target B | Warped A | Ghost overlay | Plane masks]")
+    print(f"\nOutputs -> '{out_dir}/':")
+    print("  warped_output.png   — Image A warped to align with B")
+    print("  plane_masks.png     — Soft plane mask colours on source")
+    print("  masks_on_source.png — Mask overlay with region boundaries")
+    print("  comparison_grid.png — 6-panel side-by-side comparison")
 
 
 if __name__ == "__main__":
