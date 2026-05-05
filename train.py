@@ -100,7 +100,8 @@ def validate(model, val_loader, criterion, device, cfg, step, writer):
     model.eval()
     stn = HomographySTN().to(device)
     evaluator = HomographyEvaluator(cfg["eval"]["error_threshold"])
-    total_loss = 0.0
+    loss_iters = cfg["eval"].get("loss_num_iters", cfg["model"]["num_iters_train"])
+    running = {}
     n_batches  = 0
 
     for batch in tqdm(val_loader, desc="  Validating", leave=False):
@@ -108,29 +109,46 @@ def validate(model, val_loader, criterion, device, cfg, step, writer):
         img_b = batch["img_b"].to(device, non_blocking=True)
         img_c = batch["img_c"].to(device, non_blocking=True)
 
-        out   = model.forward_triplet(img_a, img_b, img_c, cfg["eval"]["num_iters"])
+        out   = model.forward_triplet(img_a, img_b, img_c, loss_iters)
         losses = criterion(out, img_a, img_b, img_c, model.feature_extractor, stn)
-        total_loss += losses["total"].item()
+        for k, v in losses.items():
+            value = v.item() if isinstance(v, torch.Tensor) else float(v)
+            running[k] = running.get(k, 0.0) + value
 
         gt_pts = batch.get("gt_points")
         if gt_pts is not None:
             gt_pts = gt_pts.to(device)
+            metric_iters = cfg["eval"]["num_iters"]
+            out_ab_metric = (
+                model.forward(img_a, img_b, metric_iters)
+                if metric_iters != loss_iters
+                else out["ab"]
+            )
+        else:
+            out_ab_metric = out["ab"]
         evaluator.update(
-            out["ab"]["H_final"], out["ab"]["masks"], gt_pts,
+            out_ab_metric["H_final"], out_ab_metric["masks"], gt_pts,
             cfg["data"]["patch_height"], cfg["data"]["patch_width"],
         )
         n_batches += 1
 
-    avg = total_loss / max(n_batches, 1)
+    avg_losses = {k: v / max(n_batches, 1) for k, v in running.items()}
+    avg = avg_losses.get("total", float("inf"))
     results = evaluator.summary()
 
-    writer.add_scalar("val/loss_total", avg, step)
+    for name, value in avg_losses.items():
+        writer.add_scalar(f"val/loss_{name}", value, step)
     if results:
         writer.add_scalar("val/mean_error",  results["mean_error"],      step)
         writer.add_scalar("val/inlier_pct",  results["mean_inlier_pct"], step)
 
+    loss_summary = "  ".join(
+        f"{k}={avg_losses[k]:.4f}"
+        for k in ["total", "recon", "triplet", "geo", "triangle"]
+        if k in avg_losses
+    )
     log.info(
-        f"  [Val] loss={avg:.4f}  "
+        f"  [Val] iters={loss_iters}  {loss_summary}  "
         + ("  ".join(f"{k}={v:.3f}" for k, v in results.items()) if results else "no GT")
     )
     model.train()

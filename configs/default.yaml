@@ -76,6 +76,7 @@ train:
 eval:
   batch_size:         4
   num_iters:          24
+  loss_num_iters:     12             # Keep val loss comparable to train loss
   visualize:          true
   vis_dir:            "vis_results"
   error_threshold:    3.0            # Pixel threshold for inlier counting
