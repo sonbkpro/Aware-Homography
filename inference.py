@@ -119,6 +119,43 @@ def tensor_to_bgr(
     return cv2.cvtColor(np_rgb, cv2.COLOR_RGB2BGR)
 
 
+def bgr_to_unit_tensor(img_bgr: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Convert a cropped BGR uint8 image to a BCHW float tensor in [0, 1]."""
+    t = torch.from_numpy(img_bgr.transpose(2, 0, 1)).float() / 255.0
+    return t.unsqueeze(0).to(device)
+
+
+def unit_tensor_to_bgr(tensor: torch.Tensor) -> np.ndarray:
+    """Convert a CHW/BCHW [0, 1] tensor whose channels are BGR to BGR uint8."""
+    t = tensor.detach().cpu().float()
+    if t.ndim == 4:
+        t = t[0]
+    t = t.clamp(0.0, 1.0)
+    if t.shape[0] == 1:
+        t = t.repeat(3, 1, 1)
+    return (t.permute(1, 2, 0).numpy() * 255).round().astype(np.uint8)
+
+
+def mean_abs_gray_diff(img_1_bgr: np.ndarray, img_2_bgr: np.ndarray) -> float:
+    """Mean absolute grayscale difference in uint8 intensity units."""
+    g1 = cv2.cvtColor(img_1_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g2 = cv2.cvtColor(img_2_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    return float(np.abs(g1 - g2).mean())
+
+
+def corner_displacement_px(H: np.ndarray, height: int, width: int) -> Tuple[float, float]:
+    """Return mean/max displacement of the four crop corners under H."""
+    corners = np.array(
+        [[0, 0, 1], [width - 1, 0, 1], [width - 1, height - 1, 1], [0, height - 1, 1]],
+        dtype=np.float64,
+    )
+    warped = corners @ H.T
+    denom = np.where(np.abs(warped[:, 2:3]) < 1e-8, 1e-8, warped[:, 2:3])
+    warped_xy = warped[:, :2] / denom
+    disp = np.linalg.norm(warped_xy - corners[:, :2], axis=1)
+    return float(disp.mean()), float(disp.max())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Warping strategies
 # ─────────────────────────────────────────────────────────────────────────────
@@ -420,11 +457,14 @@ def infer_pair(
     H_all = out["H_final"]   # (1, K, 3, 3)
     masks = out["masks"]     # (1, K, Hf, Wf)
 
-    warped_t, weights_t = warp_multiplane(
-        img_a_t, H_all, masks, strategy=strategy, stn=stn
+    # Estimate H from the trained grayscale pipeline, but apply that H to the
+    # cropped colour source for human-readable output.
+    img_a_color_t = bgr_to_unit_tensor(img_a_crop, device)
+    warped_color_t, weights_t = warp_multiplane(
+        img_a_color_t, H_all, masks, strategy=strategy, stn=stn
     )
 
-    warped_bgr = tensor_to_bgr(warped_t[0], transform.mean, transform.std)
+    warped_bgr = unit_tensor_to_bgr(warped_color_t)
 
     def _up(t):
         return F.interpolate(
@@ -436,6 +476,8 @@ def infer_pair(
 
     support    = masks[0].flatten(1).sum(dim=-1)
     dominant_k = int(support.argmax().item())
+    diff_before = mean_abs_gray_diff(img_a_crop, img_b_crop)
+    diff_after  = mean_abs_gray_diff(warped_bgr, img_b_crop)
 
     return {
         "warped_bgr":  warped_bgr,
@@ -445,6 +487,8 @@ def infer_pair(
         "masks_np":    masks_np,
         "weights_np":  weights_np,
         "dominant_k":  dominant_k,
+        "diff_before": diff_before,
+        "diff_after":  diff_after,
     }
 
 
@@ -535,8 +579,22 @@ def main():
         f"k{k}={result['masks_np'][k].mean()*100:.1f}%"
         for k in range(K)
     ))
+    print(
+        "Mean |gray difference| to target: "
+        f"A vs B = {result['diff_before']:.2f}, "
+        f"warped A vs B = {result['diff_after']:.2f}"
+    )
+    if result["diff_after"] >= result["diff_before"]:
+        print(
+            "Warning: warped A is not closer to B by this simple pixel metric. "
+            "If H is near identity below, check that the checkpoint is trained "
+            "and not from a NaN run."
+        )
+    crop_h, crop_w = result["img_a_crop"].shape[:2]
     for k in range(K):
-        print(f"\nH^{k} =\n{np.round(result['H_all'][k], 5)}")
+        mean_disp, max_disp = corner_displacement_px(result["H_all"][k], crop_h, crop_w)
+        print(f"\nH^{k}  corner displacement: mean={mean_disp:.2f}px max={max_disp:.2f}px")
+        print(np.round(result["H_all"][k], 5))
 
     print(f"\nOutputs -> '{out_dir}/':")
     print("  warped_output.png   — Image A warped to align with B")
