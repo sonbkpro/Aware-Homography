@@ -130,25 +130,34 @@ class CorrPyramid:
             flow_lvl = flow / scale  # (B, 2, H, W)
 
             # Build sampling grid: for each source pixel (i, j), sample
-            # a (2r+1)×(2r+1) window centred at (i+flow_u, j+flow_v)
+            # a (2r+1)×(2r+1) target window centred at
+            # (j + flow_u, i + flow_v).  The base source coordinate is
+            # essential: without it every pixel samples around the same
+            # top-left target neighbourhood, which makes the update nearly
+            # independent of the actual image pair.
             r = radius
-            grid_offsets = torch.stack(
-                torch.meshgrid(
-                    torch.arange(-r, r + 1, device=flow.device),
-                    torch.arange(-r, r + 1, device=flow.device),
-                    indexing="ij",
-                ),
-                dim=-1,
-            ).float()  # (2r+1, 2r+1, 2)
+            offset_y, offset_x = torch.meshgrid(
+                torch.arange(-r, r + 1, device=flow.device, dtype=flow.dtype),
+                torch.arange(-r, r + 1, device=flow.device, dtype=flow.dtype),
+                indexing="ij",
+            )
+            grid_offsets = torch.stack([offset_x, offset_y], dim=-1)  # x/y order
 
-            # Normalise flow to [-1, 1] grid
+            ys, xs = torch.meshgrid(
+                torch.arange(H, device=flow.device, dtype=flow.dtype),
+                torch.arange(W, device=flow.device, dtype=flow.dtype),
+                indexing="ij",
+            )
+            base = torch.stack([xs, ys], dim=-1)  # (H, W, 2), x/y order
+
             # flow_lvl: (B, 2, H, W) → (B, H, W, 2)
             flow_perm = flow_lvl.permute(0, 2, 3, 1)  # (B, H, W, 2)
-            flow_flat = flow_perm.reshape(B * H * W, 1, 1, 2)
+            coords = base.unsqueeze(0) / scale + flow_perm
+            coords_flat = coords.reshape(B * H * W, 1, 1, 2)
 
             # Offsets broadcast to (B*H*W, 2r+1, 2r+1, 2)
-            offsets = grid_offsets.to(flow.device).unsqueeze(0)  # (1, 2r+1, 2r+1, 2)
-            sample_pts = flow_flat + offsets  # (B*H*W, 2r+1, 2r+1, 2)
+            offsets = grid_offsets.unsqueeze(0)  # (1, 2r+1, 2r+1, 2)
+            sample_pts = coords_flat + offsets  # (B*H*W, 2r+1, 2r+1, 2)
 
             # Normalise to [-1, 1]
             sample_pts[..., 0] = 2.0 * sample_pts[..., 0] / (Wt - 1) - 1.0

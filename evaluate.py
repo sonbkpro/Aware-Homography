@@ -172,6 +172,7 @@ def main():
     model = build_model(cfg).to(device)
     ckpt  = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt.get("model", ckpt))
+    model.set_warmup_mode(False)
     log.info(f"Loaded: {args.checkpoint}")
 
     vis_dir = args.vis_dir if cfg["eval"].get("visualize", True) else None

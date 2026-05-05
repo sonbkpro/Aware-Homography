@@ -91,6 +91,22 @@ class TestCorrelation:
         expected_ch = 2 * (2 * 2 + 1) ** 2
         assert feats.shape == (B, expected_ch, H, W)
 
+    def test_corr_lookup_zero_flow_samples_matching_pixel(self):
+        from deep_homography.models.correlation import CorrPyramid
+        h, w = 3, 3
+        c = h * w
+        feat = torch.zeros(1, c, h, w)
+        for y in range(h):
+            for x in range(w):
+                feat[0, y * w + x, y, x] = 1.0
+
+        pyr = CorrPyramid(feat, feat, num_levels=1)
+        flow = torch.zeros(1, 2, h, w)
+        lookup = pyr.lookup(flow, radius=0)
+
+        expected = torch.full((h, w), 1.0 / (c ** 0.5))
+        assert torch.allclose(lookup[0, 0], expected, atol=1e-6)
+
     def test_soft_argmax_shape(self, feat_pair):
         from deep_homography.models.correlation import SoftArgmaxCorrespondence
         sa   = SoftArgmaxCorrespondence()

@@ -246,6 +246,7 @@ class MultiPlaneHomographyNet(nn.Module):
                 num_iters=num_iters,
                 img_h=H_patch,
                 img_w=W_patch,
+                initial_flow=flow_init,
             )  # List[(B, 3, 3)], length = num_iters
 
             H_preds_all.append(H_preds_k)

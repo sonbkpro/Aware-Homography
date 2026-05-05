@@ -258,9 +258,25 @@ class IterativeRefiner(nn.Module):
         # Warp utility
         self.stn = HomographySTN()
 
-    def _init_flow(self, B: int, H: int, W: int, device: torch.device) -> torch.Tensor:
-        """Returns zero flow (identity initialisation)."""
-        return torch.zeros(B, 2, H, W, device=device)
+    def _init_flow(
+        self,
+        B: int,
+        H: int,
+        W: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        initial_flow: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return a coarse initial flow, using soft-argmax if provided."""
+        if initial_flow is None:
+            return torch.zeros(B, 2, H, W, device=device, dtype=dtype)
+
+        _, _, H0, W0 = initial_flow.shape
+        flow = F.interpolate(initial_flow, size=(H, W), mode="bilinear", align_corners=False)
+        scale = torch.tensor(
+            [W / W0, H / H0], device=device, dtype=dtype
+        ).view(1, 2, 1, 1)
+        return flow * scale
 
     def _flow_to_H(
         self,
@@ -285,6 +301,7 @@ class IterativeRefiner(nn.Module):
         num_iters:     int = 12,
         img_h:         int = 315,
         img_w:         int = 560,
+        initial_flow:  Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """
         Performs iterative refinement for plane k.
@@ -306,7 +323,9 @@ class IterativeRefiner(nn.Module):
 
         # ---- Initialise ----
         hidden, context = self.context_enc(feat_a_coarse)   # (B, D, Hc, Wc)
-        flow = self._init_flow(B, Hc, Wc, feat_a_coarse.device)  # (B, 2, Hc, Wc)
+        flow = self._init_flow(
+            B, Hc, Wc, feat_a_coarse.device, feat_a_coarse.dtype, initial_flow
+        )  # (B, 2, Hc, Wc)
 
         # ---- Build correlation pyramid (level3 resolution) ----
         corr_pyramid = CorrPyramid(feat_a_coarse, feat_b_coarse, self.corr_levels)
@@ -331,8 +350,10 @@ class IterativeRefiner(nn.Module):
             flow_fine = F.interpolate(flow, size=feat_a_fine.shape[-2:], mode="bilinear", align_corners=False)
             scale_x = feat_a_fine.shape[-1] / Wc
             scale_y = feat_a_fine.shape[-2] / Hc
-            flow_fine[:, 0] *= scale_x
-            flow_fine[:, 1] *= scale_y
+            flow_scale = torch.tensor(
+                [scale_x, scale_y], device=flow_fine.device, dtype=flow_fine.dtype
+            ).view(1, 2, 1, 1)
+            flow_fine = flow_fine * flow_scale
 
             # ---- Downsample mask to match coarse flow if needed ----
             mask_fine = F.interpolate(masks_k, size=feat_a_fine.shape[-2:], mode="bilinear", align_corners=False)

@@ -65,6 +65,18 @@ def masked_feature_l1(
     return weighted.sum() / denom
 
 
+def masked_feature_l1_parts(
+    feat_warped: torch.Tensor,
+    feat_target: torch.Tensor,
+    mask_w: torch.Tensor,
+    mask_t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return numerator and denominator for globally normalised mask L1."""
+    joint_mask = mask_w * mask_t
+    diff = (feat_warped - feat_target).abs()
+    return (joint_mask * diff).sum(), joint_mask.sum()
+
+
 # ---------------------------------------------------------------------------
 # 1. Per-plane reconstruction loss
 # ---------------------------------------------------------------------------
@@ -88,11 +100,14 @@ def reconstruction_loss(
       3. Compute masked L1 between warped features and target features.
       4. Weight by plane k's mask.
 
-    The total loss is the sum over K planes.
+    The total loss is globally normalised across K planes.  This avoids a
+    degenerate shortcut where a zero-support plane contributes zero loss and
+    lowers the average simply by collapsing.
     If K=1 this reduces exactly to Eq.4 of the original paper.
     """
     B, K, _, _ = masks.shape
-    plane_losses = []
+    numerator = masks.new_tensor(0.0)
+    denominator = masks.new_tensor(0.0)
 
     for k in range(K):
         H_k = H_final[:, k]           # (B, 3, 3)
@@ -112,12 +127,13 @@ def reconstruction_loss(
         )  # (B, 1, H_f, W_f)
 
         # Forward reconstruction: warped source vs target
-        loss_fwd = masked_feature_l1(
+        num_k, den_k = masked_feature_l1_parts(
             feats_a_warped, feats_b, mask_k_warped_feat, mask_k
         )
-        plane_losses.append(loss_fwd)
+        numerator = numerator + num_k
+        denominator = denominator + den_k
 
-    return sum(plane_losses) / K
+    return numerator / (denominator + 1e-8)
 
 
 # ---------------------------------------------------------------------------
@@ -266,6 +282,23 @@ def sequence_loss(
     return sum(weighted)
 
 
+def mask_balance_loss(masks: torch.Tensor) -> torch.Tensor:
+    """
+    Penalise total collapse to a single plane.
+
+    Entropy regularisation makes masks crisp, but by itself it also rewards the
+    trivial all-pixels-one-plane solution.  A small batch-level balance term
+    keeps every plane alive long enough to specialise.
+    """
+    B, K, _, _ = masks.shape
+    if K == 1:
+        return masks.new_tensor(0.0)
+    support = masks.flatten(2).mean(dim=-1)       # (B, K), sums to 1 per sample
+    mean_support = support.mean(dim=0)            # (K,)
+    target = torch.full_like(mean_support, 1.0 / K)
+    return (mean_support - target).pow(2).mean()
+
+
 # ---------------------------------------------------------------------------
 # Master loss function
 # ---------------------------------------------------------------------------
@@ -293,6 +326,7 @@ class TotalLoss(nn.Module):
         self.lambda_triangle      = lc["lambda_triangle"]
         self.lambda_mask_smooth   = lc["lambda_mask_smooth"]
         self.lambda_mask_entropy  = lc["lambda_mask_entropy"]
+        self.lambda_mask_balance  = lc.get("lambda_mask_balance", 0.0)
         self.gamma                = lc["gamma"]
 
         self.stn = None   # set by caller after HomographySTN is created
@@ -366,6 +400,7 @@ class TotalLoss(nn.Module):
         masks_ab = out_ab["masks"]   # (B, K, H_f, W_f)
         losses["mask_tv"]  = self.lambda_mask_smooth  * mask_tv_loss(masks_ab)
         losses["mask_ent"] = self.lambda_mask_entropy * mask_entropy_loss(masks_ab)
+        losses["mask_balance"] = self.lambda_mask_balance * mask_balance_loss(masks_ab)
 
         # ---- Total ----
         losses["total"] = sum(v for v in losses.values())

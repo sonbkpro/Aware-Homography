@@ -48,6 +48,7 @@ loss:
   lambda_triangle:     0.1           # Triangle consistency (NEW)
   lambda_mask_smooth:  0.01          # TV smoothness on masks
   lambda_mask_entropy: 0.01          # Entropy → hard plane assignments
+  lambda_mask_balance: 0.01          # Prevent all planes collapsing to one mask
   mu:                  0.01          # Inverse consistency weight (paper μ)
   gamma:               0.85          # RAFT sequence loss decay
 

@@ -177,6 +177,7 @@ def main():
         print(f"[demo] Loaded checkpoint: {args.checkpoint}")
     else:
         print("[demo] No checkpoint loaded — running with random/default weights.")
+    model.set_warmup_mode(False)
     model.eval()
 
     stn       = HomographySTN().to(device)

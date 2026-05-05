@@ -446,6 +446,7 @@ def infer_pair(
         "dominant_k"  : int — index of the plane with most spatial support
     """
     model.eval()
+    model.set_warmup_mode(False)
     stn = HomographySTN().to(device)
 
     img_a_t, img_b_t, img_a_crop, img_b_crop = preprocess_pair(
@@ -478,6 +479,7 @@ def infer_pair(
     dominant_k = int(support.argmax().item())
     diff_before = mean_abs_gray_diff(img_a_crop, img_b_crop)
     diff_after  = mean_abs_gray_diff(warped_bgr, img_b_crop)
+    flow_init = out["flow_init"].detach()
 
     return {
         "warped_bgr":  warped_bgr,
@@ -489,6 +491,8 @@ def infer_pair(
         "dominant_k":  dominant_k,
         "diff_before": diff_before,
         "diff_after":  diff_after,
+        "flow_init_mean_abs": float(flow_init.abs().mean().item()),
+        "flow_init_max_abs":  float(flow_init.abs().max().item()),
     }
 
 
@@ -532,6 +536,7 @@ def main():
     model = build_model(cfg).to(device)
     ckpt  = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(ckpt.get("model", ckpt))
+    model.set_warmup_mode(False)
     model.eval()
     print(f"Loaded: {args.checkpoint}")
 
@@ -583,6 +588,11 @@ def main():
         "Mean |gray difference| to target: "
         f"A vs B = {result['diff_before']:.2f}, "
         f"warped A vs B = {result['diff_after']:.2f}"
+    )
+    print(
+        "Soft-argmax initial flow: "
+        f"mean |flow| = {result['flow_init_mean_abs']:.2f}px, "
+        f"max |flow| = {result['flow_init_max_abs']:.2f}px"
     )
     if result["diff_after"] >= result["diff_before"]:
         print(
