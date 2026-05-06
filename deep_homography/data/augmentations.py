@@ -151,11 +151,12 @@ class TrainTransform:
             RandomCropPair(crop_h, crop_w),
             RandomHorizontalFlipPair(p=0.5),
         ]
-        self.photometric = [
-            IndependentGaussianBlur(p=0.3),
-            IndependentBrightnessContrast(p=0.5),
-            IndependentGammaNoise(p=0.3),
-        ]
+        # Keep photometry comparable across frames.  The training loss uses
+        # image-space reconstruction, so independently changing brightness,
+        # contrast, blur, or noise per frame creates false mismatches and
+        # rewards poor geometry.  Re-enable only with a photometry-invariant
+        # loss such as census/NCC.
+        self.photometric = []
         self.grayscale = grayscale
         self.mean = mean
         self.std  = std

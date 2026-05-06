@@ -215,7 +215,11 @@ class MultiPlaneHomographyNet(nn.Module):
         # ================================================================
         # 3. Predict K plane masks
         # ================================================================
-        masks = self._compute_masks(feat_a_fine, feat_b_fine)  # (B, K, H/4, W/4)
+        masks_pred = self._compute_masks(feat_a_fine, feat_b_fine)  # (B, K, H/4, W/4)
+        if self.warmup_mode:
+            masks = torch.full_like(masks_pred, 1.0 / self.num_planes)
+        else:
+            masks = masks_pred
 
         # ================================================================
         # 4. Per-plane iterative refinement + DLT

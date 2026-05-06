@@ -5,12 +5,14 @@ All loss components for multi-plane unsupervised deep homography estimation.
 
 Loss taxonomy (referencing the paper review):
 
-  L_recon    : Per-plane feature-space reconstruction (extends Eq.4 of original paper).
-               Uses learned features (not pixel intensity) — same as original paper.
-               But extends to K planes with partition-of-unity mask weighting.
+  L_recon    : Robust image-space reconstruction.
+               Warps image A with each plane H, blends planes by the predicted
+               target-space masks, and compares to image B with Charbonnier
+               intensity + gradient penalties over valid warped pixels.
 
-  L_triplet  : Contrastive triplet loss (Eq.5-6 of original paper, extended to K planes).
-               Minimises ||M^k ⊙ (F_a_warped - F_b)||_1 while maximising ||F_a - F_b||_1.
+  L_triplet  : Legacy contrastive feature term. Disabled by default because
+               maximising feature distance fights correspondence matching unless
+               feature scale is otherwise constrained.
 
   L_geo      : Geodesic inverse consistency on SL(3).
                Replaces the Frobenius-norm ||H_ab H_ba - I||^2_F (Eq.6, μ term) with
@@ -35,46 +37,37 @@ import torch.nn.functional as F
 from typing import List, Dict
 
 from deep_homography.utils.homography_utils import (
-    warp_image, geodesic_distance, H_compose, H_inverse, normalise_H
+    geodesic_distance, H_compose, H_inverse, normalise_H
 )
 from deep_homography.models.plane_mask_head import mask_tv_loss, mask_entropy_loss
 
 
 # ---------------------------------------------------------------------------
-# Helper: masked feature L1 reconstruction
+# Helper: robust image-space reconstruction
 # ---------------------------------------------------------------------------
 
-def masked_feature_l1(
-    feat_warped: torch.Tensor,   # (B, C, H, W)
-    feat_target: torch.Tensor,   # (B, C, H, W)
-    mask_w:      torch.Tensor,   # (B, 1, H, W) mask of warped source
-    mask_t:      torch.Tensor,   # (B, 1, H, W) mask of target
-) -> torch.Tensor:
-    """
-    Normalised masked L1 feature loss (Eq.4 generalised):
-
-        Ln = Σ_i (M_w · M_t) · ||F_w - F_t||_1  /  Σ_i (M_w · M_t)
-
-    The joint mask M_w · M_t ensures we only compare pixels that BOTH the
-    warped source and the target agree are reliable (inlier).
-    """
-    joint_mask = mask_w * mask_t              # (B, 1, H, W)
-    diff = (feat_warped - feat_target).abs()  # (B, C, H, W)
-    weighted = joint_mask * diff              # (B, C, H, W)
-    denom = joint_mask.sum() + 1e-8
-    return weighted.sum() / denom
+def denormalise_image(img: torch.Tensor, mean: float, std: float) -> torch.Tensor:
+    """Map normalised image tensors back to [0, 1] for photometric losses."""
+    return (img * std + mean).clamp(0.0, 1.0)
 
 
-def masked_feature_l1_parts(
-    feat_warped: torch.Tensor,
-    feat_target: torch.Tensor,
-    mask_w: torch.Tensor,
-    mask_t: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return numerator and denominator for globally normalised mask L1."""
-    joint_mask = mask_w * mask_t
-    diff = (feat_warped - feat_target).abs()
-    return (joint_mask * diff).sum(), joint_mask.sum()
+def charbonnier(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    """Smooth L1-like penalty with stable gradients around zero."""
+    return torch.sqrt(x * x + eps * eps)
+
+
+def image_gradients(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward finite differences in x and y."""
+    dx = img[:, :, :, 1:] - img[:, :, :, :-1]
+    dy = img[:, :, 1:, :] - img[:, :, :-1, :]
+    return dx, dy
+
+
+def masked_mean(value: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Average a per-pixel/per-channel value under a single-channel mask."""
+    if mask.shape[1] == 1 and value.shape[1] != 1:
+        mask = mask.expand(-1, value.shape[1], *mask.shape[2:])
+    return (value * mask).sum() / (mask.sum() + eps)
 
 
 # ---------------------------------------------------------------------------
@@ -90,50 +83,51 @@ def reconstruction_loss(
     H_final:  torch.Tensor,        # (B, K, 3, 3) final homographies per plane
     feat_extractor: nn.Module,     # Feature extractor (shared, frozen during loss eval)
     stn:      nn.Module,           # HomographySTN
+    mean:     float = 0.485,
+    std:      float = 0.229,
+    gradient_weight: float = 0.25,
 ) -> torch.Tensor:
     """
-    Per-plane masked feature reconstruction loss.
+    Multi-plane image reconstruction loss.
 
-    For each plane k:
-      1. Warp I_a by H^k.
-      2. Extract features of warped I_a.
-      3. Compute masked L1 between warped features and target features.
-      4. Weight by plane k's mask.
-
-    The total loss is globally normalised across K planes.  This avoids a
-    degenerate shortcut where a zero-support plane contributes zero loss and
-    lowers the average simply by collapsing.
-    If K=1 this reduces exactly to Eq.4 of the original paper.
+    Earlier revisions used features from the trainable matcher itself as the
+    reconstruction target.  That is a weak anchor: the feature extractor can
+    change its scale/semantics while the homography stays near identity.  This
+    loss compares denormalised images directly, blends the K warped planes by
+    their target-space masks, and ignores pixels that warp outside the source.
     """
     B, K, _, _ = masks.shape
-    numerator = masks.new_tensor(0.0)
-    denominator = masks.new_tensor(0.0)
+    _, C, H, W = img_a.shape
+    img_a_raw = denormalise_image(img_a, mean, std)
+    img_b_raw = denormalise_image(img_b, mean, std)
+    masks_full = F.interpolate(masks, size=(H, W), mode="bilinear", align_corners=False)
+
+    warped_sum = torch.zeros_like(img_a_raw)
+    weight_sum = torch.zeros(B, 1, H, W, device=img_a.device, dtype=img_a.dtype)
+    ones = torch.ones(B, 1, H, W, device=img_a.device, dtype=img_a.dtype)
 
     for k in range(K):
         H_k = H_final[:, k]           # (B, 3, 3)
-        mask_k = masks[:, k : k + 1]  # (B, 1, H_f, W_f)
+        mask_k = masks_full[:, k : k + 1]
+        valid_k = stn(ones, H_k).clamp(0.0, 1.0)
+        weight_k = mask_k * valid_k
+        warped_sum = warped_sum + weight_k * stn(img_a_raw, H_k)
+        weight_sum = weight_sum + weight_k
 
-        # Warp source image (full resolution for feature extraction)
-        img_a_warped = stn(img_a, H_k)   # (B, 1, H, W)
+    warped_blend = warped_sum / weight_sum.clamp_min(1e-6)
+    valid = (weight_sum > 0.05).to(img_a.dtype)
 
-        # Extract features of warped source (reuse the shared extractor)
-        feats_a_warped = feat_extractor(img_a_warped)["level2"]  # (B, C, H_f, W_f)
+    photo = masked_mean(charbonnier(warped_blend - img_b_raw), valid)
+    if gradient_weight <= 0:
+        return photo
 
-        # Warp source mask to get M'_a
-        mask_k_up = F.interpolate(mask_k, size=img_a.shape[-2:], mode="bilinear", align_corners=False)
-        mask_k_warped = stn(mask_k_up, H_k)                          # (B, 1, H, W)
-        mask_k_warped_feat = F.interpolate(
-            mask_k_warped, size=feats_a_warped.shape[-2:], mode="bilinear", align_corners=False
-        )  # (B, 1, H_f, W_f)
-
-        # Forward reconstruction: warped source vs target
-        num_k, den_k = masked_feature_l1_parts(
-            feats_a_warped, feats_b, mask_k_warped_feat, mask_k
-        )
-        numerator = numerator + num_k
-        denominator = denominator + den_k
-
-    return numerator / (denominator + 1e-8)
+    wx = valid[:, :, :, 1:] * valid[:, :, :, :-1]
+    wy = valid[:, :, 1:, :] * valid[:, :, :-1, :]
+    warped_dx, warped_dy = image_gradients(warped_blend)
+    target_dx, target_dy = image_gradients(img_b_raw)
+    grad_x = masked_mean(charbonnier(warped_dx - target_dx), wx)
+    grad_y = masked_mean(charbonnier(warped_dy - target_dy), wy)
+    return photo + gradient_weight * (grad_x + grad_y)
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +251,9 @@ def sequence_loss(
     feat_extractor: nn.Module,
     stn:         nn.Module,
     gamma:       float = 0.85,
+    mean:        float = 0.485,
+    std:         float = 0.229,
+    gradient_weight: float = 0.25,
 ) -> torch.Tensor:
     """
     Exponentially weighted loss over GRU iterates, following RAFT.
@@ -270,16 +267,19 @@ def sequence_loss(
     K = len(H_preds_all)
     num_iters = len(H_preds_all[0])
     weighted = []
+    weight_sum = 0.0
 
     for i in range(num_iters):
         weight = gamma ** (num_iters - i - 1)
         H_iter = torch.stack([H_preds_all[k][i] for k in range(K)], dim=1)  # (B, K, 3, 3)
         loss_i = reconstruction_loss(
-            img_a, img_b, feats_a, feats_b, masks, H_iter, feat_extractor, stn
+            img_a, img_b, feats_a, feats_b, masks, H_iter, feat_extractor, stn,
+            mean=mean, std=std, gradient_weight=gradient_weight,
         )
         weighted.append(weight * loss_i)
+        weight_sum += weight
 
-    return sum(weighted)
+    return sum(weighted) / max(weight_sum, 1e-8)
 
 
 def mask_balance_loss(masks: torch.Tensor) -> torch.Tensor:
@@ -328,6 +328,10 @@ class TotalLoss(nn.Module):
         self.lambda_mask_entropy  = lc["lambda_mask_entropy"]
         self.lambda_mask_balance  = lc.get("lambda_mask_balance", 0.0)
         self.gamma                = lc["gamma"]
+        self.photometric_gradient_weight = lc.get("photometric_gradient_weight", 0.25)
+        dc = cfg["data"]
+        self.normalize_mean = dc.get("normalize_mean", 0.485)
+        self.normalize_std = dc.get("normalize_std", 0.229)
 
         self.stn = None   # set by caller after HomographySTN is created
 
@@ -364,23 +368,31 @@ class TotalLoss(nn.Module):
             out_ab["H_preds"], img_a, img_b,
             out_ab["feat_a_fine"], out_ab["feat_b_fine"],
             out_ab["masks"], feat_extractor, stn, self.gamma,
+            mean=self.normalize_mean, std=self.normalize_std,
+            gradient_weight=self.photometric_gradient_weight,
         )
         l_recon_ba = sequence_loss(
             out_ba["H_preds"], img_b, img_a,
             out_ba["feat_a_fine"], out_ba["feat_b_fine"],
             out_ba["masks"], feat_extractor, stn, self.gamma,
+            mean=self.normalize_mean, std=self.normalize_std,
+            gradient_weight=self.photometric_gradient_weight,
         )
         losses["recon"] = self.lambda_recon * (l_recon_ab + l_recon_ba)
 
         # ---- 2. Contrastive triplet loss ----
-        l_contrast_ab = triplet_contrastive_loss(
-            out_ab["feat_a_fine"], out_ab["feat_b_fine"]
-        )
-        l_contrast_ba = triplet_contrastive_loss(
-            out_ba["feat_a_fine"], out_ba["feat_b_fine"]
-        )
-        # We MAXIMISE these (subtract in total), per paper Eq.6 (−λL term)
-        losses["triplet"] = -self.lambda_triplet * (l_contrast_ab + l_contrast_ba) / 2.0
+        if self.lambda_triplet:
+            l_contrast_ab = triplet_contrastive_loss(
+                out_ab["feat_a_fine"], out_ab["feat_b_fine"]
+            )
+            l_contrast_ba = triplet_contrastive_loss(
+                out_ba["feat_a_fine"], out_ba["feat_b_fine"]
+            )
+            # Disabled by default: maximising feature distance harms matching
+            # unless the feature scale is tightly controlled.
+            losses["triplet"] = -self.lambda_triplet * (l_contrast_ab + l_contrast_ba) / 2.0
+        else:
+            losses["triplet"] = img_a.new_tensor(0.0)
 
         # ---- 3. Geodesic inverse consistency ----
         H_ab_final = out_ab["H_final"]   # (B, K, 3, 3)

@@ -247,7 +247,7 @@ class DifferentiableDLT(nn.Module):
         num_points (int): Number of sampled correspondences N.
                           Must be ≥ 4 for a solvable system.
                           512 gives good coverage at 315×560.
-        eps (float):      Tikhonov regularisation for SVD stability.
+        eps (float):      Tikhonov regularisation for least-squares stability.
     """
 
     def __init__(self, num_points: int = 512, eps: float = 1e-6):
@@ -332,8 +332,8 @@ class DifferentiableDLT(nn.Module):
         dst_pts = src_pts + flow_at_pts                                     # (B, N, 2)
 
         # ---- Scale to image coordinates ----
-        scale_x = img_w / Wf
-        scale_y = img_h / Hf
+        scale_x = (img_w - 1) / max(Wf - 1, 1)
+        scale_y = (img_h - 1) / max(Hf - 1, 1)
         scale = torch.tensor([scale_x, scale_y], device=flow.device, dtype=flow.dtype)
         src_img = src_pts * scale.unsqueeze(0).unsqueeze(0)  # (B, N, 2)
         dst_img = dst_pts * scale.unsqueeze(0).unsqueeze(0)  # (B, N, 2)
@@ -341,7 +341,10 @@ class DifferentiableDLT(nn.Module):
         # ---- Sample mask weights at grid points ----
         weights = self._sample_at_coords(mask, src_pts_feat)  # (B, N, 1)
         weights = weights.squeeze(-1)                          # (B, N)
-        weights = F.softmax(weights * 10.0, dim=1)            # sharpen + normalise to sum=1
+        # Use the actual plane support.  A softmax would turn an all-zero mask
+        # into uniform weights, causing collapsed planes to estimate the same H.
+        weights = weights.clamp_min(0.0)
+        support = weights.mean(dim=1)
 
         # ---- Hartley normalisation ----
         src_norm, T_src = normalize_points(src_img)  # (B, N, 2), (B, 3, 3)
@@ -357,6 +360,10 @@ class DifferentiableDLT(nn.Module):
         # ---- Canonical scale: divide by H[2,2] ----
         scale_factor = _safe_denominator(H[:, 2, 2].view(B, 1, 1))
         H = H / scale_factor
+
+        supported = (support > 1e-4).to(H.dtype).view(B, 1, 1)
+        I = torch.eye(3, device=H.device, dtype=H.dtype).unsqueeze(0).expand(B, -1, -1)
+        H = supported * H + (1.0 - supported) * I
 
         return H
 

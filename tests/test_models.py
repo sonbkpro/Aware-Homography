@@ -141,6 +141,16 @@ class TestDifferentiableDLT:
         err = (H_norm - I).abs().max()
         assert err < 0.5, f"Zero flow DLT should be near identity, got err={err:.4f}"
 
+    def test_zero_mask_returns_identity(self):
+        """Unsupported planes should not produce arbitrary degenerate H."""
+        from deep_homography.models.differentiable_dlt import DifferentiableDLT
+        dlt = DifferentiableDLT(num_points=64)
+        flow = torch.randn(B, 2, H, W)
+        mask = torch.zeros(B, 1, H, W)
+        H_out = dlt(flow, mask, img_h=315, img_w=560)
+        I = torch.eye(3).unsqueeze(0).expand(B, -1, -1)
+        assert torch.allclose(H_out, I, atol=1e-5)
+
     def test_gradients_flow(self):
         """Identity initialisation must keep DLT backward finite."""
         from deep_homography.models.differentiable_dlt import DifferentiableDLT

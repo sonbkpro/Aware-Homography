@@ -42,10 +42,11 @@ model:
 
 # ── Loss weights ───────────────────────────────────────────────
 loss:
-  lambda_recon:        1.0           # Per-plane feature reconstruction
-  lambda_triplet:      2.0           # Contrastive (matches paper λ=2)
-  lambda_geo:          0.1           # Geodesic inverse consistency
-  lambda_triangle:     0.1           # Triangle consistency (NEW)
+  lambda_recon:        1.0           # Robust image reconstruction
+  photometric_gradient_weight: 0.25  # Edge/gradient term for image reconstruction
+  lambda_triplet:      0.0           # Negative feature distance hurts matching
+  lambda_geo:          0.01          # Geodesic inverse consistency
+  lambda_triangle:     0.01          # Temporal triangle consistency
   lambda_mask_smooth:  0.01          # TV smoothness on masks
   lambda_mask_entropy: 0.01          # Entropy → hard plane assignments
   lambda_mask_balance: 0.01          # Prevent all planes collapsing to one mask

@@ -218,7 +218,13 @@ def train(cfg, args):
             log.info(f"Epoch {epoch}: WARMUP stage (mask attention disabled)")
 
         model.train()
-        running = {k: 0.0 for k in ["total", "recon", "triplet", "geo", "triangle"]}
+        running = {
+            k: 0.0
+            for k in [
+                "total", "recon", "triplet", "geo", "triangle",
+                "mask_tv", "mask_ent", "mask_balance",
+            ]
+        }
         n_batches = 0
         t0 = time.time()
 
