@@ -299,8 +299,8 @@ class IterativeRefiner(nn.Module):
         masks_k:       torch.Tensor,  # (B, 1, H/4, W/4)  plane k mask
         dlt_solver,                    # DifferentiableDLT instance
         num_iters:     int = 12,
-        img_h:         int = 315,
-        img_w:         int = 560,
+        img_h:         int = 256,
+        img_w:         int = 256,
         initial_flow:  Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """

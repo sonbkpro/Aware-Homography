@@ -5,7 +5,7 @@ Dataset and DataLoader for unsupervised homography estimation.
 
 Faithfully mirrors the data protocol of Zhang et al. (ECCV 2020):
   - Input:  consecutive frame pairs (I_a, I_b) from real video.
-  - Patches: random crop of size 315×560.
+  - Patches: random crop of size 256×256.
   - Labels: NONE (fully unsupervised).
 
 Extension for triangle consistency loss:

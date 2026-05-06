@@ -381,7 +381,7 @@ class FourPointDLT(nn.Module):
         patch_h, patch_w: Patch dimensions.
     """
 
-    def __init__(self, patch_h: int = 315, patch_w: int = 560):
+    def __init__(self, patch_h: int = 256, patch_w: int = 256):
         super().__init__()
         self.patch_h = patch_h
         self.patch_w = patch_w

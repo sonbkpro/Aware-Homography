@@ -218,8 +218,8 @@ def normalise_H(H: torch.Tensor) -> torch.Tensor:
 
 def H_to_4corners(
     H: torch.Tensor,
-    patch_h: int = 315,
-    patch_w: int = 560,
+    patch_h: int = 256,
+    patch_w: int = 256,
 ) -> torch.Tensor:
     """
     Compute displacements of 4 patch corners under homography H.

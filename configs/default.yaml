@@ -5,8 +5,8 @@
 # ── Data ─────────────────────────────────────────────────────
 data:
   video_path:      "data/videos"     # Root dir with video files (recursive)
-  patch_height:    315               # Crop height (matches original paper)
-  patch_width:     560               # Crop width
+  patch_height:    256               # Crop height (square 256×256)
+  patch_width:     256               # Crop width
   frame_gap:       1                 # Temporal gap between pairs
   triplet_gap:     1                 # Gap for triplets (t, t+g, t+2g)
   grayscale:       true              # Convert to grayscale (matches paper)

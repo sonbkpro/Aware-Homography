@@ -41,8 +41,8 @@ class CorrVolume:
         Output corr:     (B, H, W, H, W)   (flattened target HW stored last)
                          → reshaped to (B*H*W, 1, H, W) for pooling.
 
-    Memory note: at resolution H/4 × W/4 (e.g., 78×140 for a 315×560 patch)
-    this is B × 78 × 140 × 78 × 140 ≈ B × 119M elements at float32 → ~450 MB
+    Memory note: at resolution H/4 × W/4 (e.g., 64×64 for a 256×256 patch)
+    this is B × 64 × 64 × 64 × 64 ≈ B × 16M elements at float32 → ~64 MB
     for B=8.  We therefore operate at H/8 × W/8 for the coarsest volume and
     use the H/4 level only for the final DLT correspondence extraction.
     """

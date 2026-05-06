@@ -68,7 +68,7 @@ def load_config(path: str) -> dict:
     except FileNotFoundError:
         print(f"[demo] Config '{path}' not found — using built-in defaults.")
         return {
-            "data":  {"patch_height": 315, "patch_width": 560,
+            "data":  {"patch_height": 256, "patch_width": 256,
                       "grayscale": True, "normalize_mean": 0.485, "normalize_std": 0.229},
             "model": {"backbone": "resnet34", "feature_dim": 128, "use_dino": False,
                       "num_planes": 2, "hidden_dim": 128, "context_dim": 128,

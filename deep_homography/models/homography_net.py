@@ -72,8 +72,8 @@ class MultiPlaneHomographyNet(nn.Module):
         mask_num_layers: int   = 2,
         num_points_dlt:  int   = 512,
         dlt_eps:         float = 1e-6,
-        patch_h:         int   = 315,
-        patch_w:         int   = 560,
+        patch_h:         int   = 256,
+        patch_w:         int   = 256,
     ):
         super().__init__()
         self.num_planes = num_planes

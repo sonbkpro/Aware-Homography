@@ -34,7 +34,7 @@ class RandomCropPair:
         crop_w (int): Output patch width  (paper: 560).
     """
 
-    def __init__(self, crop_h: int = 315, crop_w: int = 560):
+    def __init__(self, crop_h: int = 256, crop_w: int = 256):
         self.crop_h = crop_h
         self.crop_w = crop_w
 
@@ -141,8 +141,8 @@ class TrainTransform:
 
     def __init__(
         self,
-        crop_h: int = 315,
-        crop_w: int = 560,
+        crop_h: int = 256,
+        crop_w: int = 256,
         grayscale: bool = True,
         mean: float = 0.485,
         std: float = 0.229,
@@ -196,8 +196,8 @@ class EvalTransform:
 
     def __init__(
         self,
-        crop_h: int = 315,
-        crop_w: int = 560,
+        crop_h: int = 256,
+        crop_w: int = 256,
         grayscale: bool = True,
         mean: float = 0.485,
         std: float = 0.229,

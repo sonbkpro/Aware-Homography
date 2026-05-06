@@ -24,8 +24,8 @@ from deep_homography.utils.homography_utils import warp_points, H_to_4corners
 def corner_l2_error(
     H_pred: torch.Tensor,      # (B, 3, 3) predicted homography
     H_gt:   torch.Tensor,      # (B, 3, 3) ground-truth homography
-    patch_h: int = 315,
-    patch_w: int = 560,
+    patch_h: int = 256,
+    patch_w: int = 256,
 ) -> torch.Tensor:
     """
     Mean L2 distance between predicted and GT corner displacements.
@@ -184,8 +184,8 @@ class HomographyEvaluator:
         H_pred:    torch.Tensor,              # (B, 3, 3) or (B, K, 3, 3)
         masks:     Optional[torch.Tensor],    # (B, K, H, W) if K>1
         gt_points: Optional[torch.Tensor],    # (B, N, 2, 2) or None
-        patch_h:   int = 315,
-        patch_w:   int = 560,
+        patch_h:   int = 256,
+        patch_w:   int = 256,
     ):
         """Update metrics with one batch."""
         # If multi-plane, select dominant plane for evaluation

@@ -28,7 +28,7 @@ def feat_pair():
 
 @pytest.fixture
 def dummy_img():
-    return torch.randn(B, 1, 315, 560)   # grayscale, full patch size
+    return torch.randn(B, 1, 256, 256)   # grayscale, full patch size
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ class TestHomographyUtils:
     def test_H_to_4corners(self):
         from deep_homography.utils import H_to_4corners
         I  = torch.eye(3).unsqueeze(0).expand(B, -1, -1)
-        d  = H_to_4corners(I, patch_h=315, patch_w=560)
+        d  = H_to_4corners(I, patch_h=256, patch_w=256)
         assert d.shape == (B, 4, 2)
         assert d.abs().max() < 1e-4, "Identity H should give zero corner displacements"
 
@@ -125,7 +125,7 @@ class TestDifferentiableDLT:
         dlt  = DifferentiableDLT(num_points=64)
         flow = torch.zeros(B, 2, H, W)
         mask = torch.ones(B, 1, H, W)
-        H_out = dlt(flow, mask, img_h=315, img_w=560)
+        H_out = dlt(flow, mask, img_h=256, img_w=256)
         assert H_out.shape == (B, 3, 3)
 
     def test_identity_flow(self):
@@ -134,7 +134,7 @@ class TestDifferentiableDLT:
         dlt  = DifferentiableDLT(num_points=64)
         flow = torch.zeros(B, 2, H, W)
         mask = torch.ones(B, 1, H, W)
-        H_out = dlt(flow, mask, img_h=315, img_w=560)
+        H_out = dlt(flow, mask, img_h=256, img_w=256)
         # Normalise and compare
         H_norm = H_out / H_out[:, 2:3, 2:3].clamp(min=1e-8)
         I = torch.eye(3).unsqueeze(0).expand(B, -1, -1)
@@ -147,7 +147,7 @@ class TestDifferentiableDLT:
         dlt = DifferentiableDLT(num_points=64)
         flow = torch.randn(B, 2, H, W)
         mask = torch.zeros(B, 1, H, W)
-        H_out = dlt(flow, mask, img_h=315, img_w=560)
+        H_out = dlt(flow, mask, img_h=256, img_w=256)
         I = torch.eye(3).unsqueeze(0).expand(B, -1, -1)
         assert torch.allclose(H_out, I, atol=1e-5)
 
@@ -157,7 +157,7 @@ class TestDifferentiableDLT:
         dlt  = DifferentiableDLT(num_points=16)
         flow = torch.zeros(B, 2, 10, 18, requires_grad=True)
         mask = torch.ones(B, 1, 10, 18)
-        H_out = dlt(flow, mask, 315, 560)
+        H_out = dlt(flow, mask, 256, 256)
         H_out.sum().backward()
         assert flow.grad is not None, "Gradient did not flow through DLT"
         assert torch.isfinite(H_out).all(), "DLT produced non-finite homography"
@@ -165,7 +165,7 @@ class TestDifferentiableDLT:
 
     def test_four_point_dlt(self):
         from deep_homography.models.differentiable_dlt import FourPointDLT
-        fpdlt  = FourPointDLT(315, 560)
+        fpdlt  = FourPointDLT(256, 256)
         delta  = torch.zeros(B, 8)
         H_out  = fpdlt(delta)
         assert H_out.shape == (B, 3, 3)
@@ -267,19 +267,19 @@ class TestAugmentations:
 
     def test_train_transform_output_shape(self):
         from deep_homography.data.augmentations import TrainTransform
-        tf = TrainTransform(crop_h=315, crop_w=560)
+        tf = TrainTransform(crop_h=256, crop_w=256)
         imgs = self._dummy_frames(3)
         out  = tf(imgs)
         assert len(out) == 3
         for t in out:
-            assert t.shape == (1, 315, 560), f"Unexpected shape {t.shape}"
+            assert t.shape == (1, 256, 256), f"Unexpected shape {t.shape}"
 
     def test_eval_transform_output_shape(self):
         from deep_homography.data.augmentations import EvalTransform
-        tf = EvalTransform(crop_h=315, crop_w=560)
+        tf = EvalTransform(crop_h=256, crop_w=256)
         imgs = self._dummy_frames(2)
         out  = tf(imgs)
-        assert all(t.shape == (1, 315, 560) for t in out)
+        assert all(t.shape == (1, 256, 256) for t in out)
 
     def test_spatial_consistency(self):
         """Same spatial crop must be applied to all frames."""
